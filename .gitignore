@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# LabVIEW
+*.lvlps
+*.aliases
+*.lck
+
+# Data
+*.csv
+*.npz
+*.npy
+scan_data/
+saved_images/
+
+# Local Settings
+.vscode/
+.idea/
+*.ini
+
+# Temporary / Backups
+*.zip
+*.bak
+*.tmp

@@ -15,6 +15,7 @@ Usage:
     window.show()
 """
 
+import os
 import csv
 import numpy as np
 from datetime import datetime
@@ -29,7 +30,6 @@ from labview_manager import LabVIEWManager, CMD_IDLE, CMD_MEASURE
 
 # Physics
 SPEED_OF_LIGHT_MM_FS = 0.000299792458
-GLOBAL_ZERO_POS_MM = 140.0
 
 
 class PumpProbeScanWindow(QtWidgets.QWidget):
@@ -84,7 +84,17 @@ class PumpProbeScanWindow(QtWidgets.QWidget):
         self.zero_spin = QtWidgets.QDoubleSpinBox()
         self.zero_spin.setRange(0, 300)
         self.zero_spin.setDecimals(3)
-        self.zero_spin.setValue(GLOBAL_ZERO_POS_MM)
+        if self.delay_stage:
+            self.zero_spin.setValue(self.delay_stage.zero_position)
+        else:
+            self.zero_spin.setValue(140.0)
+            
+        def on_zero_changed(val):
+            if self.delay_stage:
+                self.delay_stage.zero_position = val
+            self._update_stage_display()
+        
+        self.zero_spin.valueChanged.connect(on_zero_changed)
         zero_layout.addWidget(self.zero_spin, 0, 1)
         
         self.chk_probe = QtWidgets.QCheckBox("Probe on Stage")
@@ -147,6 +157,13 @@ class PumpProbeScanWindow(QtWidgets.QWidget):
             sp_st.setValue(st_def)
             gl.addWidget(sp_st, 1, 1)
 
+            # Connect signals
+            if not always_on:
+                grp.toggled.connect(self._update_point_count)
+            sp_s.valueChanged.connect(self._update_point_count)
+            sp_e.valueChanged.connect(self._update_point_count)
+            sp_st.valueChanged.connect(self._update_point_count)
+
             self.interval_spins.append((sp_s, sp_e, sp_st, self.lbl_start, self.lbl_end, self.lbl_step))
             self.interval_checks.append(grp) # The groupbox itself is the check
             left_layout.addWidget(grp)
@@ -185,10 +202,29 @@ class PumpProbeScanWindow(QtWidgets.QWidget):
         self.cmb_plot_mode.setCurrentIndex(0) # Default dT/T
         acq_layout.addWidget(self.cmb_plot_mode, 4, 1)
 
+        # Data Saving Group
+        save_group = QtWidgets.QGroupBox("Data to Save")
+        save_layout = QtWidgets.QVBoxLayout(save_group)
+        
+        self.chk_save_t = QtWidgets.QCheckBox("Transmission (T)")
+        self.chk_save_dt = QtWidgets.QCheckBox("DeltaT (dT)")
+        self.chk_save_dtt = QtWidgets.QCheckBox("DeltaT/T")
+        self.chk_save_raw = QtWidgets.QCheckBox("Raw (Odd/Even)")
+        
+        # Defaults: dT/T on? Or user chooses? 
+        self.chk_save_dtt.setChecked(True) 
+        
+        save_layout.addWidget(self.chk_save_t)
+        save_layout.addWidget(self.chk_save_dt)
+        save_layout.addWidget(self.chk_save_dtt)
+        save_layout.addWidget(self.chk_save_raw)
+        
+        acq_layout.addWidget(save_group, 5, 0, 1, 2)
+        
         self.btn_bg = QtWidgets.QPushButton("Acquire Background")
         self.btn_bg.setStyleSheet("background-color: #607D8B; color: white;")
         self.btn_bg.clicked.connect(self._acquire_background)
-        acq_layout.addWidget(self.btn_bg, 5, 0, 1, 2)
+        acq_layout.addWidget(self.btn_bg, 6, 0, 1, 2)
         
         left_layout.addWidget(acq_group)
 
@@ -221,6 +257,9 @@ class PumpProbeScanWindow(QtWidgets.QWidget):
         self.status_label = QtWidgets.QLabel("Status: Ready")
         self.status_label.setStyleSheet("color: #4CAF50; font-weight: bold;")
         left_layout.addWidget(self.status_label)
+        
+        # Initial count update
+        self._update_point_count()
 
         left_layout.addStretch()
         main_layout.addWidget(left_panel)
@@ -264,7 +303,11 @@ class PumpProbeScanWindow(QtWidgets.QWidget):
         abs_layout.addWidget(QtWidgets.QLabel("Position (mm):"), 0, 0)
         self.spin_abs_mm = QtWidgets.QDoubleSpinBox()
         self.spin_abs_mm.setRange(0.0, 300.0)
-        self.spin_abs_mm.setValue(GLOBAL_ZERO_POS_MM)
+        # Default to current zero if known
+        if self.delay_stage:
+             self.spin_abs_mm.setValue(self.delay_stage.zero_position)
+        else:
+             self.spin_abs_mm.setValue(140.0)
         self.spin_abs_mm.setDecimals(3)
         self.spin_abs_mm.setSingleStep(0.01)
         abs_layout.addWidget(self.spin_abs_mm, 0, 1)
@@ -426,8 +469,8 @@ class PumpProbeScanWindow(QtWidgets.QWidget):
         """Convert delay (fs) to stage shift (mm). Reverses if Probe on Stage."""
         dist = self._fs_to_mm_dist(time_fs, to_mm=True)
         if self.chk_probe.isChecked():
-            return -dist
-        return dist
+            return -dist  # Probe: Move Closer (-mm) -> +Delay
+        return dist       # Pump: Move Away (+mm) -> +Delay
     
     def _mm_to_fs(self, distance_mm):
         """Convert stage shift (mm) to delay (fs). Reverses if Probe on Stage."""
@@ -525,7 +568,9 @@ class PumpProbeScanWindow(QtWidgets.QWidget):
         
         for i, (sp_s, sp_e, sp_st, _, _, _) in enumerate(self.interval_spins):
             # Check enabled
-            if i < len(self.interval_checks) and not self.interval_checks[i].isChecked():
+            # If group is checkable, respect its checked state.
+            # If group is NOT checkable (Always On), start is implied True.
+            if self.interval_checks[i].isCheckable() and not self.interval_checks[i].isChecked():
                 continue
                 
             s, e, st = sp_s.value(), sp_e.value(), sp_st.value()
@@ -540,37 +585,22 @@ class PumpProbeScanWindow(QtWidgets.QWidget):
             # If s > e (reverse scan), handle it
             if st <= 0: continue
             
+            # Use inclusive range for each interval
+            # This ensures endpoints are included even if there are gaps between intervals
             if s <= e:
-                pts = np.arange(s, e, st)
+                pts = np.arange(s, e + st*0.001, st)
             else:
-                pts = np.arange(s, e, -st) # Descending scan?
-                # Usually step is positive magnitude in UI.
+                pts = np.arange(s, e - st*0.001, -st) 
                 
             points.extend(pts.tolist())
             
-        # Add final endpoint of LAST enabled interval
-        if points and self.interval_spins:
-            # Find last enabled interval info
-            last_enabled = -1
-            for i in range(len(self.interval_checks)-1, -1, -1):
-                if self.interval_checks[i].isChecked():
-                    last_enabled = i
-                    break
-            
-            if last_enabled >= 0:
-                e_last = self.interval_spins[last_enabled][1].value()
-                if is_mm:
-                    e_last = self._fs_to_mm_dist(e_last, False)
-                points.append(e_last)
-
-        return np.unique(np.array(points)) # Unique sorts them. Careful if user wants specific order?
-        # Pump-Probe usually monotonic. np.unique sorts ascending.
-        # If user defined Intervals 1,2,3 in overlapping/strange ways, unique helps.
-        # But if they wanted a specific sequence, unique destroys it.
-        # Standard usage: Interval 1 (-100 to 0), Interval 2 (0 to 100).
-        # np.unique is safe and good to remove duplicates at boundaries.
         if len(points) == 0: return np.array([])
         return np.sort(np.unique(np.array(points)))
+
+    def _update_point_count(self):
+        """Update the Points label to show how many points will be scanned."""
+        pts = self._generate_scan_points()
+        self.points_label.setText(f"Points: {len(pts)}")
     
     # =========================================================================
     # Scan Control
@@ -597,6 +627,13 @@ class PumpProbeScanWindow(QtWidgets.QWidget):
         self.scan_index = 0
         self.scanning = True
         self.scan_curve.setData([], [])
+        
+        # Data Storage
+        self.data_t = []
+        self.data_dt = []
+        self.data_dtt = []
+        self.raw_odd = []
+        self.raw_even = []
         
         # Generate Standardized Paths
         timestamp = datetime.now()
@@ -767,46 +804,67 @@ class PumpProbeScanWindow(QtWidgets.QWidget):
                 # Handle Background
                 if hasattr(self, '_awaiting_background') and self._awaiting_background:
                     # Store average of Odd/Even as background
-                    self.manager.background = (odd + even) / 2.0
+                    # Store BOTH Odd and Even for Scattering Correction
+                    self.manager.background = (odd.copy(), even.copy())
                     self._awaiting_background = False
-                    self.status_label.setText("Status: Global Background Acquired")
-                    QtWidgets.QMessageBox.information(self, "Background", "Global Background acquired!")
+                    self.status_label.setText("Status: Global Background Acquired (Scattering Mode)")
+                    QtWidgets.QMessageBox.information(self, "Background", "Global Background acquired! (Odd/Even stored separately)")
                     return
 
                 # Apply Background
-                if self.manager.background is not None:
-                    if self.manager.background.shape == odd.shape:
-                        odd -= self.manager.background
-                        even -= self.manager.background
+                bg = self.manager.background
+                if bg is not None:
+                    # New Mode: Tuple (odd_bg, even_bg)
+                    if isinstance(bg, (tuple, list)) and len(bg) == 2:
+                        bg_odd, bg_even = bg
+                        if bg_odd.shape == odd.shape and bg_even.shape == even.shape:
+                            odd -= bg_odd
+                            even -= bg_even
+                    # Legacy / Single Frame
+                    elif hasattr(bg, 'shape') and bg.shape == odd.shape:
+                        odd -= bg
+                        even -= bg
                 
                 # Compute based on Plot Mode
                 
-                # Compute based on Plot Mode
+                # Compute All Forms
+                img_t = (odd + even) / 2.0
+                img_dt = even - odd
+                img_dtt = np.divide(even - odd, odd, out=np.zeros_like(odd), where=np.abs(odd) > 1.0)
+                
+                # Plot choice
                 pmode = self.cmb_plot_mode.currentIndex()
-                if pmode == 1:   # Transmission (T) -> (Odd + Even) / 2
-                    img = (odd + even) / 2.0
-                elif pmode == 2: # DeltaT (dT) -> Even - Odd
-                    img = even - odd
-                else:            # DeltaT/T -> (Even - Odd) / Odd
-                    img = np.divide(even - odd, odd, out=np.zeros_like(odd), where=np.abs(odd) > 1.0)
-                
-                # Skip empty data
+                if pmode == 1:   img = img_t
+                elif pmode == 2: img = img_dt
+                else:            img = img_dtt
+
+                # Skip empty data check (on display img)
                 if img.size == 0:
-                    print(f"[SCAN] Empty data at point {self.scan_index+1}")
-                    self.scan_index += 1
-                    QtCore.QTimer.singleShot(50, self._move_stage)
-                    return
-                if img.ndim == 1:
-                    side = int(np.sqrt(img.size))
-                    if side * side == img.size:
-                        img = img.reshape(side, side)
-                
+                   # ... existing error handling ...
+                   pass 
+
                 if img.ndim == 2:
                     self.img_item.setImage(img.T)
                 
                 signal = self._extract(img)
-                to_save = self._extract_to_save(img)
-                self.roi_datacube.append(to_save)
+                
+                # Save Selected
+                if self.chk_save_t.isChecked():
+                    self.data_t.append(self._extract_to_save(img_t))
+                if self.chk_save_dt.isChecked():
+                    self.data_dt.append(self._extract_to_save(img_dt))
+                if self.chk_save_dtt.isChecked():
+                    self.data_dtt.append(self._extract_to_save(img_dtt))
+                
+                # Legacy roi_datacube always stores the PLOTTED mode? 
+                # Or should we deprecate roi_datacube in favor of specific keys?
+                # To maintain compatibility with show_data_lw.py default:
+                self.roi_datacube.append(self._extract_to_save(img))
+                
+                # Save Raw if requested
+                if self.chk_save_raw.isChecked():
+                    self.raw_odd.append(self._extract_to_save(odd))
+                    self.raw_even.append(self._extract_to_save(even))
                 
                 self.scan_delays.append(delay_fs)
                 self.scan_signals.append(signal)
@@ -851,7 +909,14 @@ class PumpProbeScanWindow(QtWidgets.QWidget):
                 signals=np.array(self.scan_signals),
                 zero_mm=self.zero_spin.value(),
                 frames_per_point=self.frames_spin.value(),
-                roi_datacube=np.array(self.roi_datacube) if self.roi_datacube else np.array([])
+                roi_datacube=np.array(self.roi_datacube) if self.roi_datacube else np.array([]),
+                # Selective Saves
+                data_t=np.array(self.data_t) if self.data_t else np.array([]),
+                data_dt=np.array(self.data_dt) if self.data_dt else np.array([]),
+                data_dtt=np.array(self.data_dtt) if self.data_dtt else np.array([]),
+                # Raw
+                raw_odd=np.array(self.raw_odd) if self.raw_odd else np.array([]),
+                raw_even=np.array(self.raw_even) if self.raw_even else np.array([])
             )
             self.status_label.setText(
                 f"Status: Scan complete! Saved to {os.path.basename(self.scan_npz_path)}"

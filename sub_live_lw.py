@@ -85,6 +85,7 @@ class LiveViewWindow(QtWidgets.QWidget):
         self.setWindowTitle("Live View (LabVIEW)")
         self.resize(1200, 900)
         self._setup_ui()
+        self._init_stage_polling()
     
     def _setup_ui(self):
         main_layout = QtWidgets.QVBoxLayout(self)
@@ -114,7 +115,7 @@ class LiveViewWindow(QtWidgets.QWidget):
 
         ctrl_layout.addWidget(QtWidgets.QLabel("Mode:"), 0, 4)
         self.mode_combo = QtWidgets.QComboBox()
-        self.mode_combo.addItems(["ΔT/T (dT)", "Transmission (T)", "DeltaT (dT)"])
+        self.mode_combo.addItems(["ΔT/T (dT)", "Transmission (T)", "DeltaT (dT)", "Even (Pump On)"])
         self.mode_combo.currentIndexChanged.connect(self._change_mode)
         ctrl_layout.addWidget(self.mode_combo, 0, 5)
         
@@ -332,19 +333,18 @@ class LiveViewWindow(QtWidgets.QWidget):
         c = 0.000299792458
         
         # Negative Steps
+        # Negative Steps
         for i, fs in enumerate(steps_fs):
-            mm_val = -(fs * c / 2.0)
             lbl = f"-{fs}fs" if fs < 1000 else f"-{fs/1000:.0f}ps"
             btn = QtWidgets.QPushButton(lbl)
-            btn.clicked.connect(lambda _, val=mm_val: self._move_stage_rel(val))
+            btn.clicked.connect(lambda _, val=-fs: self._move_stage_by_fs(val))
             step_layout.addWidget(btn, 1, i)
 
         # Positive Steps
         for i, fs in enumerate(steps_fs):
-            mm_val = (fs * c / 2.0)
             lbl = f"+{fs}fs" if fs < 1000 else f"+{fs/1000:.0f}ps"
             btn = QtWidgets.QPushButton(lbl)
-            btn.clicked.connect(lambda _, val=mm_val: self._move_stage_rel(val))
+            btn.clicked.connect(lambda _, val=fs: self._move_stage_by_fs(val))
             step_layout.addWidget(btn, 2, i)
             
         stage_layout.addLayout(step_layout)
@@ -355,8 +355,17 @@ class LiveViewWindow(QtWidgets.QWidget):
         self.spin_zero = QtWidgets.QDoubleSpinBox()
         self.spin_zero.setDecimals(4)
         self.spin_zero.setRange(-50, 350)
-        self.spin_zero.setValue(0.0)
-        self.spin_zero.valueChanged.connect(self._update_stage_ui)
+        if self.delay_stage:
+            self.spin_zero.setValue(self.delay_stage.zero_position)
+        else:
+            self.spin_zero.setValue(140.0) # Default fallback
+            
+        def on_zero_changed(val):
+            if self.delay_stage:
+                self.delay_stage.zero_position = val
+            self._update_stage_ui()
+            
+        self.spin_zero.valueChanged.connect(on_zero_changed)
         zero_layout.addWidget(QtWidgets.QLabel("Zero:"))
         zero_layout.addWidget(self.spin_zero)
         stage_layout.addLayout(zero_layout)
@@ -463,7 +472,10 @@ class LiveViewWindow(QtWidgets.QWidget):
         save_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "saved_images")
         os.makedirs(save_dir, exist_ok=True)
         
-        mode_tag = "dT" if self.mode_combo.currentIndex() == 0 else "T"
+        idx = self.mode_combo.currentIndex()
+        tags = ["dT_T", "T", "dT", "Even"]
+        mode_tag = tags[idx] if idx < len(tags) else "img"
+        
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         filename = f"liveview_{mode_tag}_{timestamp}.npy"
         filepath = os.path.join(save_dir, filename)
@@ -500,11 +512,15 @@ class LiveViewWindow(QtWidgets.QWidget):
             vi.SetControlValue("N", n)
             vi.SetControlValue("Acq Trigger", True)
             vi.SetControlValue("Stoplive", False)
-            vi.SetControlValue("Enum", CMD_GETFRAME)
+            vi.SetControlValue("Enum", CMD_GETFRAME) 
             
             self.status_label.setText("Status: Live view active")
-            self.poll_timer.start(100)
+            self.poll_timer.start(100) # Slower poll is fine for Getframe
             
+            # Stats
+            if self.batch_count % PROFILE_THROTTLE == 0:
+                self._update_profiles()
+                
         except Exception as e:
             self.status_label.setText(f"Status: Error — {e}")
             self.acquiring = False
@@ -521,76 +537,72 @@ class LiveViewWindow(QtWidgets.QWidget):
         mode = self.mode_combo.currentIndex()
         
         try:
+            # For CMD_GETFRAME, LabVIEW loops continuously. 
+            # We just peek at the controls.
+            # No need to check CMD_IDLE (it will stay in Getframe/2).
+            
+            # --- READ DATA ---
+            # --- READ DATA (from previous measurement) ---
             bg = self.manager.background
             
-            if mode == 0:  # DeltaT
-                odd_val = vi.GetControlValue("Odd")
-                even_val = vi.GetControlValue("Even")
-                
-                if odd_val is None or even_val is None:
-                    self.status_label.setText("Status: Waiting for Odd/Even data...")
-                    return
+            # All modes use Odd/Even
+            odd_val = vi.GetControlValue("Odd")
+            even_val = vi.GetControlValue("Even")
+            
+            if odd_val is None or even_val is None:
+                self.status_label.setText("Status: Waiting for Odd/Even data...")
+                return
 
-                odd = np.array(odd_val, dtype=float)
-                even = np.array(even_val, dtype=float)
-                
-                # Handle Background Acquisition (Global)
-                if self._awaiting_background:
-                    # Store average of Odd/Even as background (Dark Frame)
-                    self.manager.background = (odd + even) / 2.0
-                    bg = self.manager.background
-                    self._awaiting_background = False
-                    self.status_label.setText("Status: Global Background acquired")
-                    QtWidgets.QMessageBox.information(self, "Background", "Global Background acquired!")
-                
-                # Subtract Background
-                if bg is not None and bg.shape == odd.shape:
-                    odd -= bg
-                    even -= bg
-                
-                # Compute DeltaT
-                if mode == 0: # dT/T
-                    denom = np.where(np.abs(odd) > 1e-10, odd, 1e-10)
-                    img = (even - odd) / denom
-                else: # dT (Raw Difference) - assuming mode 2 falls here if not T (which is mode 1)
-                     img = even - odd # Raw Difference
-                
-            else:  # T (mode == 1)
-                # T control does not exist. Compute T from Odd/Even
-                odd_val = vi.GetControlValue("Odd")
-                even_val = vi.GetControlValue("Even")
-                
-                if odd_val is None or even_val is None:
-                    self.status_label.setText("Status: Waiting for Odd/Even data...")
-                    return
-
-                odd = np.array(odd_val, dtype=float)
-                even = np.array(even_val, dtype=float)
-                
-                # Handle Background Acquisition (Global)
-                if self._awaiting_background:
-                    # For T mode, just use Average of Odd/Even as background
-                    bg_frame = (odd + even) / 2.0
-                    self.manager.background = bg_frame
-                    bg = self.manager.background
-                    self._awaiting_background = False
-                    self.status_label.setText("Status: Global Background acquired")
-                    QtWidgets.QMessageBox.information(self, "Background", "Global Background acquired!")
-                
-                # Subtract Background
-                if bg is not None and bg.shape == odd.shape:
+            odd = np.array(odd_val, dtype=float)
+            even = np.array(even_val, dtype=float)
+            
+            # Handle Background Acquisition (Global)
+            if self._awaiting_background:
+                # Store average of Odd/Even as background (Dark Frame)
+                # Or use different logic per mode? 
+                # Ideally background is blocked beam -> Dark Frame.
+                # So Avg(Odd, Even) is good estimate of dark noise.
+                # Store BOTH Odd and Even for Scattering Correction
+                self.manager.background = (odd.copy(), even.copy())
+                bg_data = self.manager.background
+                self._awaiting_background = False
+                self.status_label.setText("Status: Global Background acquired (Scattering Mode)")
+                QtWidgets.QMessageBox.information(self, "Background", "Global Background acquired! (Odd/Even stored separately)")
+            
+            debug_bg_mean = 0.0
+            # Subtract Background
+            if bg is not None:
+                # New Mode: Tuple (odd_bg, even_bg)
+                if isinstance(bg, (tuple, list)) and len(bg) == 2:
+                    bg_odd, bg_even = bg
+                    if bg_odd.shape == odd.shape and bg_even.shape == even.shape:
+                        odd -= bg_odd
+                        even -= bg_even
+                        debug_bg_mean = np.mean(bg_even)
+                # Legacy / Single Frame
+                elif hasattr(bg, 'shape') and bg.shape == odd.shape:
                     odd -= bg
                     even -= bg
                     debug_bg_mean = np.mean(bg)
-                else:
-                    debug_bg_mean = 0.0
-                    
-                # Compute T
-                img = (odd + even) / 2.0
+            
+            # --- COMPUTE IMAGE ---
+            if mode == 0: # dT/T
+                # (Even - Odd) / Odd. Zero out where Odd is low.
+                denom = np.where(np.abs(odd) > 1e-10, odd, 1e-10)
+                img = (even - odd) / denom
                 
-                # Update Status with Debug Info
-                debug_t_mean = np.mean(img)
-                self.status_label.setText(f"Status: Plot Mean={debug_t_mean:.2f} | Bkg Mean={debug_bg_mean:.2f}")
+            elif mode == 2: # dT (Reference - Signal approx, or just diff)
+                img = even - odd 
+                
+            elif mode == 3: # Even (Pump On)
+                img = even
+                
+            else: # T (mode 1)
+                img = (odd + even) / 2.0
+            
+            # Update Status with Debug Info
+            debug_t_mean = np.mean(img)
+            self.status_label.setText(f"Status: Mode={mode} | Mean={debug_t_mean:.2e} | Bkg={debug_bg_mean:.2e}")
                 
 
             
@@ -761,29 +773,40 @@ class LiveViewWindow(QtWidgets.QWidget):
                 cmap = pg.ColorMap(pos, color)
                 self.img_item.setLookupTable(cmap.getLookupTable(0.0, 1.0, 256))
     
-        if self.delay_stage:
-             self._poll_stage_pos()
-             # Start a timer to poll stage position every 500ms
-             self.stage_timer = QtCore.QTimer()
-             self.stage_timer.timeout.connect(self._poll_stage_pos)
-             self.stage_timer.start(500)
-             
+
     # =========================================================================
     # Stage Control Logic
     # =========================================================================
 
+    def _init_stage_polling(self):
+        """Start polling stage position if stage exists."""
+        if self.delay_stage:
+             self._poll_stage_pos()
+             self.stage_timer = QtCore.QTimer()
+             self.stage_timer.timeout.connect(self._poll_stage_pos)
+             self.stage_timer.start(500) # 2Hz poll
+
     def _poll_stage_pos(self):
         """Poll stage position periodically."""
-        if not self.delay_stage or not self.delay_stage.is_connected:
-            self.lbl_stage_pos.setText("Stage not connected")
+        if not self.delay_stage:
+            self.lbl_stage_pos.setText("No Stage Driver")
+            return
+            
+        if not self.delay_stage.is_connected:
+            self.lbl_stage_pos.setText("Stage Not Connected")
             return
 
         try:
             pos_mm = self.delay_stage.get_position()
-            zero_mm = self.spin_zero.value()
             
-            # Calculate Delay based on Pump/Probe toggle
-            # c = 0.000299792458 mm/fs
+            # Use Shared Zero
+            zero_mm = self.delay_stage.zero_position if self.delay_stage else 0.0
+            
+            # Sync Spinbox if changed externally (optional, but good)
+            if abs(self.spin_zero.value() - zero_mm) > 0.0001:
+                self.spin_zero.blockSignals(True)
+                self.spin_zero.setValue(zero_mm)
+                self.spin_zero.blockSignals(False)
             c = 0.000299792458
             
             if self.rb_pump.isChecked():
@@ -796,8 +819,8 @@ class LiveViewWindow(QtWidgets.QWidget):
             # Display both units
             self.lbl_stage_pos.setText(f"Pos: {pos_mm:.4f} mm\nDelay: {delay_fs:.1f} fs")
                 
-        except Exception:
-            self.lbl_stage_pos.setText("Stage Error")
+        except Exception as e:
+            self.lbl_stage_pos.setText(f"Stage Error: {e}")
             
     def _update_stage_ui(self):
         """Force update of stage UI (e.g. when zero changed)."""
@@ -811,10 +834,26 @@ class LiveViewWindow(QtWidgets.QWidget):
         self.status_label.setText(f"Moving to {target:.4f} mm...")
         
         def do_move():
-            self.delay_stage.move_absolute(target)
+            try:
+                print(f"[LIVE] Moving stage to {target:.4f} mm")
+                self.delay_stage.move_to(target, wait=True)
+                print(f"[LIVE] Move complete")
+            except Exception as e:
+                print(f"[LIVE] Move failed: {e}")
             
         t = threading.Thread(target=do_move, daemon=True)
         t.start()
+
+    def _move_stage_by_fs(self, fs_val):
+        """Move stage by femtoseconds, accounting for Pump/Probe config. (User requested Invert)"""
+        c = 0.000299792458
+        
+        if self.rb_pump.isChecked():
+            mm_val = (fs_val * c / 2.0)   # Pump: +mm
+        else:
+            mm_val = -(fs_val * c / 2.0)  # Probe: -mm
+            
+        self._move_stage_rel(mm_val)
         
     def _move_stage_rel(self, delta):
         if not self.delay_stage or not self.delay_stage.is_connected:

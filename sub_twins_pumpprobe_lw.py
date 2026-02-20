@@ -35,7 +35,6 @@ from labview_manager import LabVIEWManager, CMD_IDLE, CMD_MEASURE
 # ============================================================================
 
 SPEED_OF_LIGHT_MM_FS = 0.000299792458
-GLOBAL_ZERO_POS_MM = 140.0
 
 SAVE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scan_data")
 
@@ -49,7 +48,7 @@ DEFAULT_GEMINI_STEPS = 100
 # ============================================================================
 
 class SpectrumProcessor:
-    """Process interferogram → spectrum via FFT with calibration."""
+    """Process interferogram → spectrum via FFT with calibration and phasing."""
 
     def __init__(self):
         self.wavelength_cal = None
@@ -73,44 +72,157 @@ class SpectrumProcessor:
         except Exception as e:
             print(f"[WARN] Calibration load failed: {e}")
 
-    def compute_spectrum(self, positions, interferogram,
-                         wl_start=8.0, wl_stop=14.0, n_points=None):
-        """Compute spectrum from interferogram. Returns (wavelengths, power)."""
-        if len(interferogram) < 10:
-            return np.array([]), np.array([])
+    def get_dx(self, positions):
+        if len(positions) > 1:
+            return np.abs(positions[1] - positions[0])
+        return 0.08 # Default estimation
 
-        # Remove baseline
-        baseline = np.convolve(interferogram, np.ones(20)/20, mode='same')
-        data = interferogram - baseline
-
-        # Gaussian apodization
-        center = len(data) // 2
-        window = np.exp(-((np.arange(len(data)) - center) / (len(data) / 4)) ** 2)
-        data = data * window
-
-        # FFT
-        if n_points and n_points > len(data):
-            n_freq = n_points
+    def compute_phase_correction(self, positions, reference, n_points=None, pad_factor=4):
+        """Calculates phase correction from reference interferogram."""
+        from scipy.fft import fft, fftshift, fftfreq
+        
+        n_raw = len(reference)
+        # Windowing (Hanning)
+        window = np.hanning(n_raw)
+        windowed_ref = reference * window
+        
+        # Zero Padding
+        if n_points:
+            pad_length = n_points
         else:
-            n_freq = len(data) * 4
+            pad_length = n_raw * pad_factor
             
-        fft_result = np.fft.rfft(data, n=n_freq)
-        power = np.abs(fft_result) ** 2
+        # FFT and Shift
+        ref_fft = fftshift(fft(windowed_ref, n=pad_length))
+        phase_correction = np.angle(ref_fft)
+        
+        return phase_correction, pad_length
 
-        dx = np.abs(positions[1] - positions[0]) if len(positions) > 1 else 0.08
-        freq = np.fft.rfftfreq(n_freq, d=dx)
+    def compute_phased_spectrum(self, positions, interferogram, phase_correction, pad_length=None, wl_start=8.0, wl_stop=14.0):
+        """Computes phased spectrum (Absorption/Distorsion). Returns (wl, real, imag)."""
+        from scipy.fft import fft, fftshift, fftfreq
+        from scipy.interpolate import interp1d
 
-        # Convert to wavelength
+        n_raw = interferogram.shape[-1]
+        
+        # Windowing
+        window = np.hanning(n_raw)
+        windowed_data = interferogram * window
+        
+        if pad_length is None:
+            pad_length = n_raw * 4
+            
+        # FFT (Axis -1)
+        dt_fft_raw = fftshift(fft(windowed_data, n=pad_length, axis=-1), axes=-1)
+        
+        # Apply Phase
+        # Ensure phase broadcasting if data is 2D
+        if phase_correction is not None:
+            dt_phased = dt_fft_raw * np.exp(-1j * phase_correction)
+        else:
+            dt_phased = dt_fft_raw
+            
+        # Extract Real/Imag
+        real_part = np.real(dt_phased)  # Absorption
+        imag_part = np.imag(dt_phased)  # Dispersion
+        
+        # Frequency Axis
+        dx = self.get_dx(positions)
+        freq = fftshift(fftfreq(pad_length, d=dx))
+        
+        # Calibration (Freq -> WL)
+        # If calibration exists:
         if self.wavelength_cal is not None and self.reciprocal_cal is not None:
-            from scipy.interpolate import interp1d
+            # We must map freq array to wavelengths.
+            # Calibration maps Reciprocal (Freq) -> Wavelength
+            # We interp1d(Cal_Freq, Cal_WL)
+            # But we need to be careful about range.
+            
+            # Note: fftfreq returns negative and positive frequencies.
+            # Calibration typically is only for positive.
+            # We normally take only positive half for display?
+            # Or we map the whole thing?
+            
+            # The user's code returns the full FFT shift.
+            # This puts Zero freq in center.
+            # Positive freq on right (indices N/2 to N).
+            # Negative freq on left.
+            
+            # If we mask, we usually only care about positive frequencies in range [wl_start, wl_stop].
+            # Wavelength = 1/Freq.
+            # Freq < 0 -> Negative Index? Physical meaning? usually we ignore.
+            
+            # Let's filter for positive frequencies first.
+            pos_mask = freq > 0
+            freq_pos = freq[pos_mask]
+            real_pos = real_part[..., pos_mask]
+            imag_pos = imag_part[..., pos_mask]
+            
             fn = interp1d(self.reciprocal_cal, self.wavelength_cal,
                           kind='linear', fill_value='extrapolate', bounds_error=False)
-            wavelengths = fn(freq)
+            wavelengths = fn(freq_pos)
+            
+            # Interpolate to Linear Wavelength Grid (for ImageItem display)
+            # Create a linear grid between start and stop
+            n_out = len(wavelengths)
+            wl_linear = np.linspace(wl_start, wl_stop, n_out)
+            
+            # Interpolate Data onto Linear Grid
+            # Current wavelengths are monotonic? Typically yes (decreasing or increasing).
+            # Sorting might be needed if not.
+            # Assuming monotonic.
+            
+            # Interpolate Real
+            # Use interp1d. x must be monotonic.
+            
+            # Sort just in case
+            idx = np.argsort(wavelengths)
+            wl_sorted = wavelengths[idx]
+            real_sorted = real_pos[..., idx]
+            imag_sorted = imag_pos[..., idx]
+            
+            fn_real = interp1d(wl_sorted, real_sorted, kind='linear', bounds_error=False, fill_value=0.0)
+            fn_imag = interp1d(wl_sorted, imag_sorted, kind='linear', bounds_error=False, fill_value=0.0)
+            
+            real_interp = fn_real(wl_linear)
+            imag_interp = fn_imag(wl_linear)
+            
+            return wl_linear, real_interp, imag_interp
+            
         else:
-            wavelengths = 1.0 / (freq + 1e-10)
+            # No Cal -> 1/f
+            pos_mask = freq > 1e-10
+            freq_pos = freq[pos_mask]
+            wavelengths = 1.0 / freq_pos
+            
+            # Interpolate to Linear Grid
+            n_out = len(wavelengths)
+            wl_linear = np.linspace(wl_start, wl_stop, n_out)
+            
+            idx = np.argsort(wavelengths)
+            wl_sorted = wavelengths[idx]
+            real_sorted = real_pos[..., idx]
+            imag_sorted = imag_pos[..., idx]
+            
+            fn_real = interp1d(wl_sorted, real_sorted, kind='linear', bounds_error=False, fill_value=0.0)
+            fn_imag = interp1d(wl_sorted, imag_sorted, kind='linear', bounds_error=False, fill_value=0.0)
+            
+            real_interp = fn_real(wl_linear)
+            imag_interp = fn_imag(wl_linear)
+            
+            return wl_linear, real_interp, imag_interp
 
-        mask = (wavelengths >= wl_start) & (wavelengths <= wl_stop)
-        return wavelengths[mask], power[mask]
+    def compute_spectrum(self, positions, interferogram, n_points=None, wl_start=8.0, wl_stop=14.0):
+        """Legacy / Power Spectrum computation (Magnitude Squared)."""
+        # We can implement this using the phased logic with phase=0 and taking abs**2
+        # Or keep simplest logic.
+        
+        # Use simple logic for robustness if scanning for reference
+        # But we need consistent axes.
+        
+        w, r, i = self.compute_phased_spectrum(positions, interferogram, None, n_points, wl_start, wl_stop)
+        power = r**2 + i**2
+        return w, power
 
 
 # ============================================================================
@@ -147,6 +259,9 @@ class TwinsPumpProbeWindow(QtWidgets.QWidget):
         self.wavelengths = None
         self.reference_wavelengths = None
         self.current_interferogram = None
+        self.selected_wl_index = None # For Time Dynamics plot
+        self.phase_correction = None
+        self.pad_length = None
 
         self.setWindowTitle("Twins Pump-Probe (Hyperspectral)")
         self.resize(1400, 800)
@@ -164,54 +279,16 @@ class TwinsPumpProbeWindow(QtWidgets.QWidget):
     def _setup_ui(self):
         main_layout = QtWidgets.QHBoxLayout(self)
 
-        # ====== Left: Plots ======
-        left_panel = QtWidgets.QWidget()
-        left_layout = QtWidgets.QVBoxLayout(left_panel)
-        left_layout.setContentsMargins(5, 5, 5, 5)
+        # =====================================================================
+        # LEFT SIDEBAR: Controls
+        # =====================================================================
+        sidebar_panel = QtWidgets.QWidget()
+        sidebar_panel.setMaximumWidth(380)
+        sidebar_layout = QtWidgets.QVBoxLayout(sidebar_panel)
+        sidebar_layout.setContentsMargins(5, 5, 5, 5)
 
-        # Camera preview
-        camera_group = QtWidgets.QGroupBox("Last Camera Frame")
-        camera_layout = QtWidgets.QVBoxLayout(camera_group)
-
-        self.img_widget = pg.GraphicsLayoutWidget()
-        self.img_plot = self.img_widget.addPlot(title="")
-        self.img_item = pg.ImageItem()
-        self.img_plot.addItem(self.img_item)
-        camera_layout.addWidget(self.img_widget)
-        left_layout.addWidget(camera_group, stretch=1)
-
-        # Hyperspectral map
-        map_group = QtWidgets.QGroupBox("Hyperspectral Map (ΔT/T)")
-        map_layout = QtWidgets.QVBoxLayout(map_group)
-
-        self.map_widget = pg.GraphicsLayoutWidget()
-        self.map_plot = self.map_widget.addPlot(title="")
-        self.map_plot.setLabel('left', 'Wavelength Index')
-        self.map_plot.setLabel('bottom', 'Time Step')
-        self.map_item = pg.ImageItem()
-        self.map_plot.addItem(self.map_item)
-        map_layout.addWidget(self.map_widget)
-        left_layout.addWidget(map_group, stretch=1)
-
-        # Current spectrum plot
-        spectrum_group = QtWidgets.QGroupBox("Current Spectrum")
-        spectrum_layout = QtWidgets.QVBoxLayout(spectrum_group)
-        self.spectrum_plot = pg.PlotWidget()
-        self.spectrum_plot.setLabel('left', 'Intensity')
-        self.spectrum_plot.setLabel('bottom', 'Wavelength (µm)')
-        self.spectrum_plot.showGrid(x=True, y=True, alpha=0.3)
-        self.spectrum_curve = self.spectrum_plot.plot([], [], pen='c')
-        self.reference_curve = self.spectrum_plot.plot([], [], pen=pg.mkPen('r', style=QtCore.Qt.PenStyle.DashLine))
-        spectrum_layout.addWidget(self.spectrum_plot)
-        left_layout.addWidget(spectrum_group, stretch=1)
-
-        main_layout.addWidget(left_panel, stretch=2)
-
-        # ====== Right: Controls ======
-        right_panel = QtWidgets.QWidget()
-        right_panel.setMaximumWidth(380)
-        right_layout = QtWidgets.QVBoxLayout(right_panel)
-        right_layout.setContentsMargins(5, 5, 5, 5)
+        # Title / Status
+        sidebar_layout.addWidget(QtWidgets.QLabel("<b>Control Panel</b>"))
 
         # Tabs
         tabs = QtWidgets.QTabWidget()
@@ -223,51 +300,68 @@ class TwinsPumpProbeWindow(QtWidgets.QWidget):
         # Zero position
         zero_group = QtWidgets.QGroupBox("Zero Position (t=0)")
         zero_layout = QtWidgets.QHBoxLayout(zero_group)
-        zero_layout.addWidget(QtWidgets.QLabel("Position (mm):"))
+        zero_layout.addWidget(QtWidgets.QLabel("Pos (mm):"))
         self.spin_zero = QtWidgets.QDoubleSpinBox()
         self.spin_zero.setRange(0, 300)
         self.spin_zero.setDecimals(3)
-        self.spin_zero.setValue(GLOBAL_ZERO_POS_MM)
+        if self.stage_delay:
+            self.spin_zero.setValue(self.stage_delay.zero_position)
+        else:
+            self.spin_zero.setValue(140.0)
+            
+        def on_zero_changed(val):
+            if self.stage_delay:
+                self.stage_delay.zero_position = val
+        self.spin_zero.valueChanged.connect(on_zero_changed)
+        
         zero_layout.addWidget(self.spin_zero)
+        self.chk_probe = QtWidgets.QCheckBox("Probe")
+        self.chk_probe.setToolTip("If checked, stage moves Probe (Delay = Zero - Pos). Else Pump (Delay = Pos - Zero).")
+        zero_layout.addWidget(self.chk_probe)
         time_layout.addWidget(zero_group)
 
         # 3 intervals
         interval_configs = [
-            ("Interval 1 (Fine near zero)", -1000, 0, 50),
-            ("Interval 2 (Early dynamics)", 0, 10000, 500),
-            ("Interval 3 (Late dynamics)", 10000, 100000, 5000),
+            ("Interval 1 (Fine)", -1000, 0, 50),
+            ("Interval 2 (Early)", 0, 10000, 500),
+            ("Interval 3 (Late)", 10000, 100000, 5000),
         ]
         self.interval_spins = []  # [(start, end, step), ...]
 
         for label, s_def, e_def, st_def in interval_configs:
             grp = QtWidgets.QGroupBox(label)
+            if "Interval 1" not in label:
+                grp.setCheckable(True)
+                if "Interval 2" in label: grp.setChecked(True)
+                else: grp.setChecked(False)
+                grp.toggled.connect(self._update_counts)
+                
             gl = QtWidgets.QGridLayout(grp)
-
-            gl.addWidget(QtWidgets.QLabel("Start (fs):"), 0, 0)
+            gl.setContentsMargins(2, 2, 2, 2)
+            
+            gl.addWidget(QtWidgets.QLabel("Start:"), 0, 0)
             sp_s = QtWidgets.QDoubleSpinBox()
-            sp_s.setRange(-1e6, 1e6)
-            sp_s.setValue(s_def)
+            sp_s.setRange(-1e6, 1e6); sp_s.setValue(s_def)
             gl.addWidget(sp_s, 0, 1)
 
-            gl.addWidget(QtWidgets.QLabel("End (fs):"), 0, 2)
+            gl.addWidget(QtWidgets.QLabel("End:"), 0, 2)
             sp_e = QtWidgets.QDoubleSpinBox()
-            sp_e.setRange(-1e6, 1e6)
-            sp_e.setValue(e_def)
+            sp_e.setRange(-1e6, 1e6); sp_e.setValue(e_def)
             gl.addWidget(sp_e, 0, 3)
 
-            gl.addWidget(QtWidgets.QLabel("Step (fs):"), 1, 0)
+            gl.addWidget(QtWidgets.QLabel("Step:"), 1, 0)
             sp_st = QtWidgets.QDoubleSpinBox()
-            sp_st.setRange(1, 1e6)
-            sp_st.setValue(st_def)
+            sp_st.setRange(0.1, 1e6); sp_st.setValue(st_def)
             gl.addWidget(sp_st, 1, 1)
-
-            self.interval_spins.append((sp_s, sp_e, sp_st))
+            
+            self.interval_spins.append((sp_s, sp_e, sp_st, grp))
             time_layout.addWidget(grp)
 
-        self.lbl_time_points = QtWidgets.QLabel("Time points: --")
+        self.lbl_time_points = QtWidgets.QLabel("Points: --")
         self.lbl_time_points.setStyleSheet("font-weight: bold;")
         time_layout.addWidget(self.lbl_time_points)
-        tabs.addTab(time_tab, "Time Scan")
+        time_layout.addStretch()
+        tabs.addTab(time_tab, "Time")
 
         # --- Tab 2: Gemini Scan ---
         gemini_tab = QtWidgets.QWidget()
@@ -275,140 +369,220 @@ class TwinsPumpProbeWindow(QtWidgets.QWidget):
 
         gemini_layout.addWidget(QtWidgets.QLabel("Start (mm):"), 0, 0)
         self.spin_gemini_start = QtWidgets.QDoubleSpinBox()
-        self.spin_gemini_start.setRange(0, 50)
-        self.spin_gemini_start.setDecimals(2)
-        self.spin_gemini_start.setSingleStep(0.5)
-        self.spin_gemini_start.setValue(DEFAULT_GEMINI_START)
+        self.spin_gemini_start.setRange(0, 50); self.spin_gemini_start.setValue(DEFAULT_GEMINI_START)
         gemini_layout.addWidget(self.spin_gemini_start, 0, 1)
 
         gemini_layout.addWidget(QtWidgets.QLabel("Stop (mm):"), 1, 0)
         self.spin_gemini_stop = QtWidgets.QDoubleSpinBox()
-        self.spin_gemini_stop.setRange(0, 50)
-        self.spin_gemini_stop.setDecimals(2)
-        self.spin_gemini_stop.setSingleStep(0.5)
-        self.spin_gemini_stop.setValue(DEFAULT_GEMINI_STOP)
+        self.spin_gemini_stop.setRange(0, 50); self.spin_gemini_stop.setValue(DEFAULT_GEMINI_STOP)
         gemini_layout.addWidget(self.spin_gemini_stop, 1, 1)
 
-        gemini_layout.addWidget(QtWidgets.QLabel("Number of Steps:"), 2, 0)
+        gemini_layout.addWidget(QtWidgets.QLabel("Steps:"), 2, 0)
         self.spin_gemini_steps = QtWidgets.QSpinBox()
-        self.spin_gemini_steps.setRange(2, 10000)
-        self.spin_gemini_steps.setValue(DEFAULT_GEMINI_STEPS)
+        self.spin_gemini_steps.setRange(2, 10000); self.spin_gemini_steps.setValue(DEFAULT_GEMINI_STEPS)
         gemini_layout.addWidget(self.spin_gemini_steps, 2, 1)
 
-        gemini_layout.addWidget(QtWidgets.QLabel("Step Size:"), 3, 0)
+        gemini_layout.addWidget(QtWidgets.QLabel("Size:"), 3, 0)
         self.lbl_step_size = QtWidgets.QLabel("-- µm")
-        self.lbl_step_size.setStyleSheet("font-weight: bold;")
         gemini_layout.addWidget(self.lbl_step_size, 3, 1)
-
-        tabs.addTab(gemini_tab, "Spectrum Scan")
-        right_layout.addWidget(tabs)
-
-        # Acquisition settings
+        gemini_layout.setRowStretch(4, 1)
+        tabs.addTab(gemini_tab, "Spectrum")
+        
+        # --- Tab 3: Settings ---
+        settings_tab = QtWidgets.QWidget()
+        settings_layout = QtWidgets.QVBoxLayout(settings_tab)
+        
+        # Acquisition
         acq_group = QtWidgets.QGroupBox("Acquisition")
-        acq_layout = QtWidgets.QGridLayout(acq_group)
-        acq_layout.addWidget(QtWidgets.QLabel("Frames/point:"), 0, 0)
+        acq_l = QtWidgets.QGridLayout(acq_group)
+        acq_l.addWidget(QtWidgets.QLabel("Frames/pt:"), 0, 0)
         self.spin_frames = QtWidgets.QSpinBox()
-        self.spin_frames.setRange(2, 10000)
-        self.spin_frames.setValue(100)
-        acq_layout.addWidget(self.spin_frames, 0, 1)
-
-        # Sample Name
-        acq_layout.addWidget(QtWidgets.QLabel("Sample Name:"), 1, 0)
+        self.spin_frames.setRange(2, 10000); self.spin_frames.setValue(100)
+        acq_l.addWidget(self.spin_frames, 0, 1)
+        acq_l.addWidget(QtWidgets.QLabel("Sample:"), 1, 0)
         self.txt_sample_name = QtWidgets.QLineEdit()
-        self.txt_sample_name.setPlaceholderText("Enter sample name...")
-        acq_layout.addWidget(self.txt_sample_name, 1, 1)
-
-        self.lbl_total = QtWidgets.QLabel("Total: --")
-        self.lbl_total.setStyleSheet("font-weight: bold;")
-        acq_layout.addWidget(self.lbl_total, 1, 0, 1, 2)
-        self.lbl_total.setStyleSheet("font-weight: bold;")
-        acq_layout.addWidget(self.lbl_total, 1, 0, 1, 2)
+        self.txt_sample_name.setPlaceholderText("Name...")
+        acq_l.addWidget(self.txt_sample_name, 1, 1)
+        self.lbl_total = QtWidgets.QLabel("Total Time: --")
+        acq_l.addWidget(self.lbl_total, 2, 0, 1, 2)
+        settings_layout.addWidget(acq_group)
         
-        right_layout.addWidget(acq_group)
-
-        # Save/Plot Settings
-        save_mode_group = QtWidgets.QGroupBox("Save & Plot Settings")
-        save_mode_layout = QtWidgets.QVBoxLayout(save_mode_group)
+        # Save/Plot
+        sp_group = QtWidgets.QGroupBox("Save & Plot")
+        sp_l = QtWidgets.QVBoxLayout(sp_group)
         
-        # Save Mode
-        save_layout_h = QtWidgets.QHBoxLayout()
-        save_layout_h.addWidget(QtWidgets.QLabel("Save Mode:"))
+        h = QtWidgets.QHBoxLayout()
+        h.addWidget(QtWidgets.QLabel("Save:"))
         self.cmb_save_mode = QtWidgets.QComboBox()
         self.cmb_save_mode.addItems(["Single Pixel", "ROI Average", "ROI (2D)", "Full Frame (2D)"])
-        self.cmb_save_mode.setCurrentIndex(1) # Default ROI Avg
-        save_layout_h.addWidget(self.cmb_save_mode)
-        save_mode_layout.addLayout(save_layout_h)
+        self.cmb_save_mode.setCurrentIndex(1)
+        h.addWidget(self.cmb_save_mode)
+        sp_l.addLayout(h)
         
-        # Plot Mode
-        plot_layout_h = QtWidgets.QHBoxLayout()
-        plot_layout_h.addWidget(QtWidgets.QLabel("Plot Mode:"))
+        h2 = QtWidgets.QHBoxLayout()
+        h2.addWidget(QtWidgets.QLabel("Plot:"))
         self.cmb_plot_mode = QtWidgets.QComboBox()
         self.cmb_plot_mode.addItems(["DeltaT (dT/T)", "Transmission (T)", "DeltaT (dT)"])
-        self.cmb_plot_mode.setCurrentIndex(0) # Default dT/T
-        plot_layout_h.addWidget(self.cmb_plot_mode)
-        save_mode_layout.addLayout(plot_layout_h)
-
+        self.cmb_plot_mode.setCurrentIndex(0)
+        h2.addWidget(self.cmb_plot_mode)
+        sp_l.addLayout(h2)
+        
         self.btn_bg = QtWidgets.QPushButton("Acquire Background")
         self.btn_bg.setStyleSheet("background-color: #607D8B; color: white;")
         self.btn_bg.clicked.connect(self._acquire_background)
-        save_mode_layout.addWidget(self.btn_bg)
+        sp_l.addWidget(self.btn_bg)
+        settings_layout.addWidget(sp_group)
         
-        # Processing Settings
-        proc_group = QtWidgets.QGroupBox("Processing Settings")
-        proc_layout = QtWidgets.QGridLayout(proc_group)
+        # Data to Save
+        save_group = QtWidgets.QGroupBox("Data Selection")
+        sl = QtWidgets.QVBoxLayout(save_group)
+        self.chk_save_t = QtWidgets.QCheckBox("Trans (T)")
+        self.chk_save_dt = QtWidgets.QCheckBox("DeltaT (dT)")
+        self.chk_save_dtt = QtWidgets.QCheckBox("DeltaT/T")
+        self.chk_save_raw = QtWidgets.QCheckBox("Raw (Odd/Even)")
+        self.chk_save_dtt.setChecked(True)
+        sl.addWidget(self.chk_save_t); sl.addWidget(self.chk_save_dt)
+        sl.addWidget(self.chk_save_dtt); sl.addWidget(self.chk_save_raw)
+        settings_layout.addWidget(save_group)
         
-        proc_layout.addWidget(QtWidgets.QLabel("Freq Points:"), 0, 0)
-        self.spin_n_points = QtWidgets.QSpinBox()
-        self.spin_n_points.setRange(0, 10000) # 0 = Auto (4x)
-        self.spin_n_points.setValue(0)
-        self.spin_n_points.setSpecialValueText("Auto (4x)")
-        proc_layout.addWidget(self.spin_n_points, 0, 1)
+        settings_layout.addStretch()
+        tabs.addTab(settings_tab, "Settings")
         
-        right_layout.addWidget(proc_group)
-        
-        right_layout.addWidget(save_mode_group)
+        sidebar_layout.addWidget(tabs)
 
-        # Status + Progress
+        # Processing (Freq Points) - Put in sidebar bottom or separate?
+        # Put in sidebar
+        proc_group = QtWidgets.QGroupBox("FFT Settings")
+        pl = QtWidgets.QHBoxLayout(proc_group)
+        pl.addWidget(QtWidgets.QLabel("Pts:"))
+        self.spin_n_points = QtWidgets.QSpinBox()
+        self.spin_n_points.setRange(0, 10000); self.spin_n_points.setValue(0)
+        self.spin_n_points.setSpecialValueText("Auto")
+        pl.addWidget(self.spin_n_points)
+        
+        pl.addWidget(QtWidgets.QLabel("Start:"))
+        self.spin_wl_start = QtWidgets.QDoubleSpinBox()
+        self.spin_wl_start.setRange(0, 20); self.spin_wl_start.setValue(8.0)
+        pl.addWidget(self.spin_wl_start)
+        
+        pl.addWidget(QtWidgets.QLabel("Stop:"))
+        self.spin_wl_stop = QtWidgets.QDoubleSpinBox()
+        self.spin_wl_stop.setRange(0, 20); self.spin_wl_stop.setValue(14.0)
+        pl.addWidget(self.spin_wl_stop)
+        
+        sidebar_layout.addWidget(proc_group)
+
+        # Status & Progress
         self.lbl_status = QtWidgets.QLabel("Ready")
         self.lbl_status.setStyleSheet("color: #4CAF50; font-weight: bold;")
-        right_layout.addWidget(self.lbl_status)
-
+        sidebar_layout.addWidget(self.lbl_status)
         self.progress_bar = QtWidgets.QProgressBar()
-        right_layout.addWidget(self.progress_bar)
+        sidebar_layout.addWidget(self.progress_bar)
 
-        # Buttons
-        self.btn_reference = QtWidgets.QPushButton("📸 Acquire Reference")
-        self.btn_reference.setStyleSheet(
-            "background-color: #2196F3; color: white; font-weight: bold; "
-            "padding: 10px; border-radius: 5px;"
-        )
+        # Action Buttons
+        self.btn_reference = QtWidgets.QPushButton("📸 Reference")
+        self.btn_reference.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold; padding: 6px;")
         self.btn_reference.clicked.connect(self._acquire_reference)
-        right_layout.addWidget(self.btn_reference)
+        sidebar_layout.addWidget(self.btn_reference)
 
-        btn_row = QtWidgets.QHBoxLayout()
-        self.btn_start = QtWidgets.QPushButton("▶ START SCAN")
-        self.btn_start.setStyleSheet(
-            "background-color: #4CAF50; color: white; font-weight: bold; "
-            "padding: 12px; border-radius: 6px;"
-        )
+        h_btn = QtWidgets.QHBoxLayout()
+        self.btn_start = QtWidgets.QPushButton("▶ START")
+        self.btn_start.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; padding: 8px;")
         self.btn_start.clicked.connect(self._start_scan)
-        btn_row.addWidget(self.btn_start)
+        h_btn.addWidget(self.btn_start)
 
         self.btn_stop = QtWidgets.QPushButton("⏹ STOP")
-        self.btn_stop.setStyleSheet(
-            "background-color: #f44336; color: white; font-weight: bold; "
-            "padding: 12px; border-radius: 6px;"
-        )
+        self.btn_stop.setStyleSheet("background-color: #f44336; color: white; font-weight: bold; padding: 8px;")
         self.btn_stop.setEnabled(False)
         self.btn_stop.clicked.connect(self._stop_scan)
-        btn_row.addWidget(self.btn_stop)
-        right_layout.addLayout(btn_row)
+        h_btn.addWidget(self.btn_stop)
+        sidebar_layout.addLayout(h_btn)
 
-        right_layout.addStretch()
+        main_layout.addWidget(sidebar_panel, stretch=0)
+
+        # =====================================================================
+        # RIGHT SIDE: PLOTS (Redesigned)
+        # =====================================================================
+        
+        # Structure:
+        # QVBoxLayout
+        #   - Top: Reference (Collapsible/Small)
+        #   - Center: Splitter (Transient Spectrum | Time Dynamics)
+        #   - Bottom: Map (Delay vs WL)
+        
+        right_panel = QtWidgets.QWidget()
+        right_layout = QtWidgets.QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        
+        # 1. Top: Reference Spectrum
+        self.ref_plot = pg.PlotWidget(title="Reference Spectrum")
+        self.ref_plot.setMaximumHeight(150)
+        self.ref_plot.showGrid(x=True, y=True, alpha=0.3)
+        self.ref_plot.setLabel('bottom', 'Wavelength (µm)')
+        self.reference_curve = self.ref_plot.plot([], [], pen='r', name="Reference")
+        right_layout.addWidget(self.ref_plot)
+        
+        # 2. Center: Split Spectrum and Dynamics
+        splitter_center = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        
+        # Left: Transient Spectrum (DT vs WL)
+        self.spectrum_plot = pg.PlotWidget(title="Transient Spectrum (DT vs λ)")
+        self.spectrum_plot.setLabel('left', 'Delta T/T')
+        self.spectrum_plot.setLabel('bottom', 'Wavelength (µm)')
+        self.spectrum_plot.showGrid(x=True, y=True, alpha=0.3)
+        self.spectrum_curve = self.spectrum_plot.plot([], [], pen='c')
+        splitter_center.addWidget(self.spectrum_plot)
+        
+        # Right: Time Dynamics (DT vs Delay)
+        self.dynamics_plot = pg.PlotWidget(title="Time Dynamics (DT vs Delay)")
+        self.dynamics_plot.setLabel('left', 'Delta T/T')
+        self.dynamics_plot.setLabel('bottom', 'Delay (fs)')
+        self.dynamics_plot.showGrid(x=True, y=True, alpha=0.3)
+        self.dynamics_curve = self.dynamics_plot.plot([], [], pen='y')
+        # Add a line indicating selected wavelength on spectrum?
+        splitter_center.addWidget(self.dynamics_plot)
+        
+        right_layout.addWidget(splitter_center, stretch=1)
+        
+        # 3. Bottom: Hyperspectral Map
+        self.map_widget = pg.GraphicsLayoutWidget()
+        self.map_plot = self.map_widget.addPlot(title="Hyperspectral Map (X: Delay, Y: Wavelength)")
+        self.map_plot.setLabel('left', 'Wavelength (µm)')
+        self.map_plot.setLabel('bottom', 'Delay (fs)')
+        self.map_item = pg.ImageItem()
+        self.map_plot.addItem(self.map_item)
+        
+        # Colorbar / Histogram (Blue-White-Red)
+        self.hist_item = pg.HistogramLUTItem()
+        self.hist_item.setImageItem(self.map_item)
+        
+        # Define Blue-White-Red Colormap manually for robustness
+        pos = np.array([0.0, 0.5, 1.0])
+        color = np.array([
+            [0, 0, 255, 255],     # Blue
+            [255, 255, 255, 255], # White
+            [255, 0, 0, 255]      # Red
+        ], dtype=np.ubyte)
+        cmap = pg.ColorMap(pos, color)
+        self.hist_item.gradient.setColorMap(cmap)
+        
+        self.map_widget.addItem(self.hist_item)
+        
+        # Crosshair for interaction
+        self.v_line = pg.InfiniteLine(angle=90, movable=False)
+        self.h_line = pg.InfiniteLine(angle=0, movable=False)
+        self.map_plot.addItem(self.v_line, ignoreBounds=True)
+        self.map_plot.addItem(self.h_line, ignoreBounds=True)
+        
+        # Click interaction
+        self.map_plot.scene().sigMouseClicked.connect(self._on_map_click)
+        
+        right_layout.addWidget(self.map_widget, stretch=1)
+        
         main_layout.addWidget(right_panel, stretch=1)
 
         # Connect signals for live count updates
-        for sp_s, sp_e, sp_st in self.interval_spins:
+        for sp_s, sp_e, sp_st, _ in self.interval_spins:
             sp_s.valueChanged.connect(self._update_counts)
             sp_e.valueChanged.connect(self._update_counts)
             sp_st.valueChanged.connect(self._update_counts)
@@ -425,16 +599,22 @@ class TwinsPumpProbeWindow(QtWidgets.QWidget):
     def _generate_time_points(self):
         """Generate sorted, unique time points from 3 intervals."""
         points = []
-        for sp_s, sp_e, sp_st in self.interval_spins:
+        for sp_s, sp_e, sp_st, grp in self.interval_spins:
+            if grp.isCheckable() and not grp.isChecked():
+                continue
+                
             s, e, step = sp_s.value(), sp_e.value(), sp_st.value()
             if step > 0 and s < e:
-                points.extend(np.arange(s, e, step).tolist())
-        if len(self.interval_spins) == 3:
-            # Include endpoint of last interval
-            _, sp_e, _ = self.interval_spins[2]
-            if sp_e.value() not in points:
-                points.append(sp_e.value())
-        return np.array(sorted(set(points)))
+                # Use inclusive range: [start, end]
+                chunk = np.arange(s, e + step*0.001, step)
+                points.extend(chunk.tolist())
+            elif step > 0 and s == e:
+                points.append(s)
+                
+        if not points:
+            return np.array([])
+            
+        return np.array(sorted(set([float(f"{p:.3f}") for p in points]))) # Round to 3 decimal to avoid float jitter duplicate
 
     def _generate_gemini_positions(self):
         start = self.spin_gemini_start.value()
@@ -529,7 +709,10 @@ class TwinsPumpProbeWindow(QtWidgets.QWidget):
         return float(np.mean(img))
     
     def _fs_to_mm(self, time_fs):
-        return time_fs * SPEED_OF_LIGHT_MM_FS / 2.0
+        dist = time_fs * SPEED_OF_LIGHT_MM_FS / 2.0
+        if self.chk_probe.isChecked():
+            return -dist  # Probe: Move Closer (-mm) -> +Delay
+        return dist       # Pump: Move Away (+mm) -> +Delay
 
     def _update_preview(self):
         """Read one frame from LabVIEW for live preview (when not scanning)."""
@@ -549,7 +732,8 @@ class TwinsPumpProbeWindow(QtWidgets.QWidget):
                     if side * side == img.size:
                         img = img.reshape(side, side)
                 if img.ndim == 2:
-                    self.img_item.setImage(img.T, autoLevels=True)
+                    # self.img_item.setImage(img.T, autoLevels=True)
+                    pass
         except Exception:
             pass
 
@@ -709,6 +893,14 @@ class TwinsPumpProbeWindow(QtWidgets.QWidget):
             # Start inner Gemini loop
             self.current_interferogram = np.zeros(len(self.gemini_positions))
             self.current_roi_datacube = []  # ROI slices for this time step
+            
+            # Selective buffers
+            self.current_data_t = []
+            self.current_data_dt = []
+            self.current_data_dtt = []
+            self.current_raw_odd = []
+            self.current_raw_even = []
+            
             self._gemini_index = 0
             QtCore.QTimer.singleShot(50, self._gemini_move_next)
 
@@ -816,34 +1008,57 @@ class TwinsPumpProbeWindow(QtWidgets.QWidget):
                 
                 # Handle Background
                 if hasattr(self, '_awaiting_background') and self._awaiting_background:
-                    self.manager.background = (odd + even) / 2.0
+                    # Store BOTH Odd and Even for Scattering Correction
+                    self.manager.background = (odd.copy(), even.copy())
                     self._awaiting_background = False
-                    self.lbl_status.setText("Global Background Acquired")
-                    QtWidgets.QMessageBox.information(self, "Background", "Global Background acquired!")
+                    self.lbl_status.setText("Global Background Acquired (Scattering Mode)")
+                    QtWidgets.QMessageBox.information(self, "Background", "Global Background acquired! (Odd/Even stored separately)")
                     return
 
                 # Apply Background
-                if self.manager.background is not None:
-                    if self.manager.background.shape == odd.shape:
-                        odd -= self.manager.background
-                        even -= self.manager.background
+                bg = self.manager.background
+                if bg is not None:
+                    # New Mode: Tuple
+                    if isinstance(bg, (tuple, list)) and len(bg) == 2:
+                        bg_odd, bg_even = bg
+                        if bg_odd.shape == odd.shape and bg_even.shape == even.shape:
+                            odd -= bg_odd
+                            even -= bg_even
+                    # Legacy
+                    elif hasattr(bg, 'shape') and bg.shape == odd.shape:
+                        odd -= bg
+                        even -= bg
                 
+                # Compute All
+                img_t = (odd + even) / 2.0
+                img_dt = even - odd
+                img_dtt = np.divide(even - odd, odd, out=np.zeros_like(odd), where=np.abs(odd) > 1.0)
+
                 if self._ref_mode:
-                    img = (odd + even) / 2.0 # Ref is Transmission
+                    # User requested Odd frames (Pump Off) for Reference
+                    img = odd
                 else:
                     pmode = self.cmb_plot_mode.currentIndex()
-                    if pmode == 1:   # Transmission
-                        img = (odd + even) / 2.0
-                    elif pmode == 2: # DeltaT (dT)
-                        img = even - odd
-                    else:            # DeltaT/T
-                        img = np.divide(even - odd, odd, out=np.zeros_like(odd), where=np.abs(odd) > 1.0)
+                    if pmode == 1:   img = img_t
+                    elif pmode == 2: img = img_dt
+                    else:            img = img_dtt
+                    
                 signal = self._extract(img)
                 self.current_interferogram[self._gemini_index] = signal
 
-                # Store full ROI slice
-                to_save = self._extract_to_save(img)
-                self.current_roi_datacube.append(to_save)
+                # Legacy ROI datacube
+                self.current_roi_datacube.append(self._extract_to_save(img))
+                
+                # Selective Save
+                if self.chk_save_t.isChecked():
+                    self.current_data_t.append(self._extract_to_save(img_t))
+                if self.chk_save_dt.isChecked():
+                    self.current_data_dt.append(self._extract_to_save(img_dt))
+                if self.chk_save_dtt.isChecked():
+                    self.current_data_dtt.append(self._extract_to_save(img_dtt))
+                if self.chk_save_raw.isChecked():
+                    self.current_raw_odd.append(self._extract_to_save(odd))
+                    self.current_raw_even.append(self._extract_to_save(even))
 
                 # Update camera preview every 10th point
                 if self._gemini_index % 10 == 0:
@@ -852,7 +1067,8 @@ class TwinsPumpProbeWindow(QtWidgets.QWidget):
                         if side * side == img.size:
                             img = img.reshape(side, side)
                     if img.ndim == 2:
-                        self.img_item.setImage(img.T, autoLevels=True)
+                        # self.img_item.setImage(img.T, autoLevels=True)
+                        pass
         except Exception as e:
             print(f"[TWINS-PP] Read error: {e}")
 
@@ -865,13 +1081,27 @@ class TwinsPumpProbeWindow(QtWidgets.QWidget):
 
     def _gemini_scan_done(self):
         """One full interferogram is complete — compute spectrum."""
-        wl, spectrum = self.processor.compute_spectrum(
-            self.gemini_positions, self.current_interferogram,
-            n_points=self.spin_n_points.value() if self.spin_n_points.value() > 0 else None
-        )
+        n_points = self.spin_n_points.value() if self.spin_n_points.value() > 0 else None
+        w_start = self.spin_wl_start.value()
+        w_stop = self.spin_wl_stop.value()
 
         if self._ref_mode:
-            # Reference acquisition
+            # Reference acquisition -> Compute Phase Correction
+            try:
+                phase, pad = self.processor.compute_phase_correction(
+                    self.gemini_positions, self.current_interferogram, n_points=n_points
+                )
+                self.phase_correction = phase
+                self.pad_length = pad
+            except Exception as e:
+                print(f"[ERROR] Phase cal failed: {e}")
+            
+            # Show Power Spectrum for Reference
+            wl, spectrum = self.processor.compute_spectrum(
+                self.gemini_positions, self.current_interferogram, n_points=n_points,
+                wl_start=w_start, wl_stop=w_stop
+            )
+
             self.reference_wavelengths = wl
             self.reference_spectrum = spectrum
             self.reference_curve.setData(wl, spectrum)
@@ -884,16 +1114,24 @@ class TwinsPumpProbeWindow(QtWidgets.QWidget):
             self.preview_timer.start(500)
             self.lbl_status.setText("Reference acquired ✓")
             self.lbl_status.setStyleSheet("color: #4CAF50; font-weight: bold;")
-            print("[TWINS-PP] Reference spectrum acquired")
+            print("[TWINS-PP] Reference spectrum acquired (Phase stored)")
             return
 
-        # Full scan mode — compute ΔT/T
-        # Full scan mode — compute Map
-        # Note: spectrum is already processed based on Plot Mode (DT, T, or DT/T)
-        # So we just treat it as the signal.
-        
-        # If we want to use Reference for Normalization (e.g. in T mode, T/T0), we could.
-        # But for Pump-Probe, usually we care about the per-shot difference.
+        # Full scan mode — compute Phase-Corrected ΔT/T
+        if self.phase_correction is not None and self.pad_length is not None:
+             wl, real, imag = self.processor.compute_phased_spectrum(
+                self.gemini_positions, self.current_interferogram, 
+                self.phase_correction, pad_length=self.pad_length,
+                wl_start=w_start, wl_stop=w_stop
+            )
+             spectrum = real # Absorption Signal
+        else:
+             # Fallback
+             wl, spectrum = self.processor.compute_spectrum(
+                self.gemini_positions, self.current_interferogram, n_points=n_points,
+                wl_start=w_start, wl_stop=w_stop
+            )
+
         delta_t = spectrum
 
         # Update spectrum plot
@@ -908,7 +1146,30 @@ class TwinsPumpProbeWindow(QtWidgets.QWidget):
             n = min(len(delta_t), self.hyperspectral_map.shape[1])
             self.hyperspectral_map[self._time_index, :n] = delta_t[:n]
 
-        self.map_item.setImage(self.hyperspectral_map.T, autoLevels=True)
+        # Update Map (X=Time, Y=Wavelength)
+        # ImageItem expects (X, Y).
+        self.map_item.setImage(self.hyperspectral_map, autoLevels=(self._time_index == 0))
+        
+        # Fix Axis Scaling (Wavelength)
+        if self.hyperspectral_map is not None:
+             n_t, n_wl = self.hyperspectral_map.shape
+             if n_wl > 1:
+                 y_scale = (w_stop - w_start) / n_wl
+                 y_origin = w_start
+                 
+                 self.map_item.resetTransform()
+                 self.map_item.scale(1, y_scale)
+                 self.map_item.setPos(0, y_origin)
+
+        # Update Dynamics Plot if selected
+        if self.selected_wl_index is not None and self.selected_wl_index < self.hyperspectral_map.shape[1]:
+            dynamics = self.hyperspectral_map[:self._time_index+1, self.selected_wl_index]
+            times = self.time_points[:self._time_index+1]
+            self.dynamics_curve.setData(times, dynamics)
+            
+            # Update Vertical Line on Map
+            # self.v_line.setPos(self.time_points[self._time_index]) # Optional: show current time
+            
 
         # Progress
         delay_fs = self.time_points[self._time_index]
@@ -958,7 +1219,13 @@ class TwinsPumpProbeWindow(QtWidgets.QWidget):
                  delta_t=delta_t,
                  interferogram=self.current_interferogram,
                  gemini_positions=self.gemini_positions,
-                 roi_datacube=np.array(self.current_roi_datacube) if self.current_roi_datacube else np.array([]))
+                 roi_datacube=np.array(self.current_roi_datacube) if self.current_roi_datacube else np.array([]),
+                 # Selective
+                 data_t=np.array(self.current_data_t) if hasattr(self,'current_data_t') and self.current_data_t else np.array([]),
+                 data_dt=np.array(self.current_data_dt) if hasattr(self,'current_data_dt') and self.current_data_dt else np.array([]),
+                 data_dtt=np.array(self.current_data_dtt) if hasattr(self,'current_data_dtt') and self.current_data_dtt else np.array([]),
+                 raw_odd=np.array(self.current_raw_odd) if hasattr(self,'current_raw_odd') and self.current_raw_odd else np.array([]),
+                 raw_even=np.array(self.current_raw_even) if hasattr(self,'current_raw_even') and self.current_raw_even else np.array([]))
         print(f"[SAVE] {os.path.basename(filename)}")
 
     def _save_final(self):
@@ -975,6 +1242,58 @@ class TwinsPumpProbeWindow(QtWidgets.QWidget):
             print(f"[SAVE] Final: {self._save_prefix}_FINAL.npz")
         except Exception as e:
             print(f"[ERROR] Final save failed: {e}")
+
+    def _on_map_click(self, event):
+        """Handle click on Hyperspectral Map to select Wavelength."""
+        pos = event.scenePos()
+        mouse_point = self.map_plot.vb.mapSceneToView(pos)
+        
+        # Map axes: X=Time (index?), Y=Wavelength (index?)
+        # Wait, ImageItem uses INDICES (0..N, 0..M) unless scaled.
+        # We haven't set scale/origin. So indices.
+        
+        t_idx = int(mouse_point.x())
+        wl_val = mouse_point.y()
+        
+        if self.hyperspectral_map is None:
+            return
+            
+        h, w = self.hyperspectral_map.shape # (Time, WL)
+        
+        # Convert physical WL to index
+        w_start = self.spin_wl_start.value()
+        w_stop = self.spin_wl_stop.value()
+        
+        if w > 1:
+            scale = (w_stop - w_start) / w
+            wl_idx = int((wl_val - w_start) / scale)
+        else:
+            wl_idx = 0
+            
+        # Clamp
+        wl_idx = max(0, min(wl_idx, w - 1))
+        
+        if 0 <= wl_idx < w:
+            self.selected_wl_index = wl_idx
+            
+            # Update Dynamics Plot
+            dynamics = self.hyperspectral_map[:self._time_index+1, wl_idx]
+            times = self.time_points[:self._time_index+1]
+            # Use real time units for plot X
+            self.dynamics_curve.setData(times, dynamics)
+            if self.wavelengths is not None:
+                # wl_val from click might be slightly off center of pixel, use actual WL
+                # But self.wavelengths is the linear grid now, or approximate?
+                # self.wavelengths is set to 'wl' in _scan_done.
+                # If using linear interpolation, self.wavelengths is the linear grid.
+                if wl_idx < len(self.wavelengths):
+                    actual_wl = self.wavelengths[wl_idx]
+                    self.dynamics_plot.setTitle(f"Time Dynamics @ {actual_wl:.3f} µm")
+            
+            # Update Crosshair
+            self.h_line.setPos(wl_val) # Crosshair at physical Y
+            self.v_line.setPos(t_idx)  # Crosshair at physical X (Index) 
+            
 
     # =========================================================================
     #  Cleanup

@@ -29,7 +29,6 @@ from labview_manager import LabVIEWManager, CMD_IDLE, CMD_GETFRAME, CMD_MEASURE
 
 # Physics
 SPEED_OF_LIGHT_MM_FS = 0.000299792458
-GLOBAL_ZERO_POS_MM = 140.0
 
 # Performance
 PROFILE_THROTTLE = 3
@@ -239,9 +238,12 @@ class DeltaTWindow(QtWidgets.QWidget):
         abs_layout.addWidget(QtWidgets.QLabel("Position (mm):"), 0, 0)
         self.spin_abs_mm = QtWidgets.QDoubleSpinBox()
         self.spin_abs_mm.setRange(0.0, 300.0)
-        self.spin_abs_mm.setValue(GLOBAL_ZERO_POS_MM)
         self.spin_abs_mm.setDecimals(3)
         self.spin_abs_mm.setSingleStep(0.01)
+        if self.delay_stage:
+            self.spin_abs_mm.setValue(self.delay_stage.zero_position)
+        else:
+            self.spin_abs_mm.setValue(140.0)
         abs_layout.addWidget(self.spin_abs_mm, 0, 1)
 
         self.btn_go = QtWidgets.QPushButton("Go")
@@ -363,7 +365,8 @@ class DeltaTWindow(QtWidgets.QWidget):
             try:
                 pos_mm = self.delay_stage.get_position()
                 self.lbl_stage_mm.setText(f"{pos_mm:.3f}")
-                delay_fs = (pos_mm - GLOBAL_ZERO_POS_MM) / SPEED_OF_LIGHT_MM_FS * 2.0
+                zero_val = self.delay_stage.zero_position if hasattr(self.delay_stage, 'zero_position') else 140.0
+                delay_fs = (pos_mm - zero_val) / SPEED_OF_LIGHT_MM_FS * 2.0
                 self.lbl_stage_fs.setText(f"{delay_fs:.0f}")
                 self.lbl_stage_status.setText("Connected")
                 self.lbl_stage_status.setStyleSheet("color: #4CAF50; font-weight: bold;")
@@ -418,8 +421,8 @@ class DeltaTWindow(QtWidgets.QWidget):
         vi.SetControlValue("N", n)
         vi.SetControlValue("Acq Trigger", True)
         vi.SetControlValue("Stoplive", False)
-        vi.SetControlValue("Enum", CMD_GETFRAME)
-
+        vi.SetControlValue("Enum", CMD_GETFRAME) 
+        
         self.acquiring = True
         self.batch_count = 0
         self._first_frame = True
@@ -429,6 +432,8 @@ class DeltaTWindow(QtWidgets.QWidget):
         self.btn_stop.setEnabled(True)
         self.lbl_status.setText("Live")
         self.lbl_status.setStyleSheet("color: #FF9800; font-weight: bold;")
+        
+        # (CMD_GETFRAME triggers itself)
 
         self.poll_timer.start(50)
 
@@ -455,15 +460,15 @@ class DeltaTWindow(QtWidgets.QWidget):
         vi = self.manager.vi
         mode = self.mode_combo.currentIndex()
         
-        # Read Odd/Even frames (Python calculation is more robust than getting "T"/"DeltaT")
-        odd_val = vi.GetControlValue("Odd")
-        even_val = vi.GetControlValue("Even")
-        
-        if odd_val is None or even_val is None:
-            self.lbl_status.setText("Status: Waiting for Odd/Even data...")
-            return
-
         try:
+            # Read Odd/Even frames (Python calculation is more robust than getting "T"/"DeltaT")
+            odd_val = vi.GetControlValue("Odd")
+            even_val = vi.GetControlValue("Even")
+        
+            if odd_val is None or even_val is None:
+                self.lbl_status.setText("Status: Waiting for Odd/Even data...")
+                return
+
             odd = np.array(odd_val, dtype=float)
             even = np.array(even_val, dtype=float)
             

@@ -319,6 +319,23 @@ class KSpaceWindow(QtWidgets.QWidget):
         self.lbl_roi_info.setStyleSheet("color: #888; font-style: italic;")
         acq_gl.addWidget(self.lbl_roi_info, 4, 0, 1, 2)
 
+        # Data Saving
+        save_group = QtWidgets.QGroupBox("Data to Save")
+        save_layout = QtWidgets.QVBoxLayout(save_group)
+        self.chk_save_t = QtWidgets.QCheckBox("Transmission (T)")
+        self.chk_save_dt = QtWidgets.QCheckBox("DeltaT (dT)")
+        self.chk_save_dtt = QtWidgets.QCheckBox("DeltaT/T")
+        self.chk_save_raw = QtWidgets.QCheckBox("Raw (Odd/Even)")
+        # Defaults
+        self.chk_save_dtt.setChecked(True)
+        
+        save_layout.addWidget(self.chk_save_t)
+        save_layout.addWidget(self.chk_save_dt)
+        save_layout.addWidget(self.chk_save_dtt)
+        save_layout.addWidget(self.chk_save_raw)
+        
+        acq_gl.addWidget(save_group, 6, 0, 1, 2)
+
         # Sample Name
         acq_gl.addWidget(QtWidgets.QLabel("Sample Name:"), 5, 0)
         self.txt_sample_name = QtWidgets.QLineEdit()
@@ -612,10 +629,14 @@ class KSpaceWindow(QtWidgets.QWidget):
         self.scan_index = 0
         self.datacube = None
         self.spectrum_cube = None
-        self.datacube = None
-        self.spectrum_cube = None
         self.roi_shape = None
-        self.roi_shape = None
+        
+        # Selective Cubes
+        self.cube_t = None
+        self.cube_dt = None
+        self.cube_dtt = None
+        self.cube_raw_odd = None
+        self.cube_raw_even = None
         
         # Generate Standardized Paths
         timestamp = datetime.now()
@@ -776,56 +797,95 @@ class KSpaceWindow(QtWidgets.QWidget):
                 even = np.array(even_data, dtype=float)
                 
                 # Handle Background
+                # Handle Background
                 if hasattr(self, '_awaiting_background') and self._awaiting_background:
-                    self.manager.background = (odd + even) / 2.0
+                    # Store BOTH Odd and Even for Scattering Correction
+                    self.manager.background = (odd.copy(), even.copy())
                     self._awaiting_background = False
-                    self.lbl_status.setText("Global Background Acquired")
-                    QtWidgets.QMessageBox.information(self, "Background", "Global Background acquired!")
+                    self.lbl_status.setText("Global Background Acquired (Scattering Mode)")
+                    QtWidgets.QMessageBox.information(self, "Background", "Global Background acquired! (Odd/Even stored separately)")
                     return
 
                 # Apply Background
-                if self.manager.background is not None:
-                    if self.manager.background.shape == odd.shape:
-                        odd -= self.manager.background
-                        even -= self.manager.background
+                # Apply Background
+                bg = self.manager.background
+                if bg is not None:
+                    # New Mode: Tuple
+                    if isinstance(bg, (tuple, list)) and len(bg) == 2:
+                        bg_odd, bg_even = bg
+                        if bg_odd.shape == odd.shape and bg_even.shape == even.shape:
+                            odd -= bg_odd
+                            even -= bg_even
+                    # Legacy
+                    elif hasattr(bg, 'shape') and bg.shape == odd.shape:
+                        odd -= bg
+                        even -= bg
                 
-                # Compute based on Plot Mode
+                # Compute All
+                img_t = (odd + even) / 2.0
+                img_dt = even - odd
+                img_dtt = np.divide(even - odd, odd, out=np.zeros_like(odd), where=np.abs(odd) > 1.0)
+
+                # Compute based on Plot Mode (for Display / Main Datacube)
                 pmode = self.cmb_plot_mode.currentIndex()
-                if pmode == 1:   # Transmission (T)
-                    img = (odd + even) / 2.0
-                elif pmode == 2: # DeltaT (dT)
-                    img = even - odd
-                else:            # DeltaT/T
-                    img = np.divide(even - odd, odd, out=np.zeros_like(odd), where=np.abs(odd) > 1.0)
+                if pmode == 1:   img = img_t
+                elif pmode == 2: img = img_dt
+                else:            img = img_dtt
+                
                 if img.size == 0:
                     self.scan_index += 1
                     QtCore.QTimer.singleShot(50, self._move_to_next)
                     return
 
-                # Extract ROI/Data to save (Always 2D)
-                roi_slice = self._extract_to_save(img)
-                # Ensure 2D if not already (it is, from _extract_to_save)
-                if roi_slice.ndim == 0: roi_slice = np.array([[roi_slice]])
-                if roi_slice.ndim == 1: roi_slice = roi_slice.reshape(1, -1)
-                
-                h, w = roi_slice.shape
+                # --- Helper to extract ROI slice ---
+                def get_roi_slice(image):
+                    s = self._extract_to_save(image)
+                    if s.ndim == 0: s = np.array([[s]])
+                    if s.ndim == 1: s = s.reshape(1, -1)
+                    return s
 
-                # First frame: allocate datacube
+                roi_slice = get_roi_slice(img)
+                h, w = roi_slice.shape
+                n_pos = len(self.scan_positions)
+
+                # --- Allocate Cubes (First Frame) ---
                 if self.datacube is None:
-                    n_pos = len(self.scan_positions)
                     self.datacube = np.zeros((n_pos, h, w), dtype=np.float64)
                     self.roi_shape = (h, w)
                     self.lbl_roi_info.setText(f"ROI: {h}x{w} px ({h*w} pixels)")
-                    print(f"[KSPACE] Datacube allocated: ({n_pos}, {h}, {w})")
+                    print(f"[KSPACE] Main Datacube allocated: ({n_pos}, {h}, {w})")
+                
+                if self.chk_save_t.isChecked() and self.cube_t is None:
+                    self.cube_t = np.zeros((n_pos, h, w), dtype=np.float64)
+                if self.chk_save_dt.isChecked() and self.cube_dt is None:
+                    self.cube_dt = np.zeros((n_pos, h, w), dtype=np.float64)
+                if self.chk_save_dtt.isChecked() and self.cube_dtt is None:
+                    self.cube_dtt = np.zeros((n_pos, h, w), dtype=np.float64)
+                if self.chk_save_raw.isChecked() and self.cube_raw_odd is None:
+                    self.cube_raw_odd = np.zeros((n_pos, h, w), dtype=np.float64)
+                    self.cube_raw_even = np.zeros((n_pos, h, w), dtype=np.float64)
 
-                # Store (handle ROI size changes gracefully)
-                if roi_slice.shape == (self.roi_shape[0], self.roi_shape[1]):
-                    self.datacube[self.scan_index] = roi_slice
-                else:
-                    # ROI changed mid-scan — use center crop/pad
-                    dh, dw = self.roi_shape
-                    self.datacube[self.scan_index, :min(h,dh), :min(w,dw)] = \
-                        roi_slice[:min(h,dh), :min(w,dw)]
+                # --- Store Data ---
+                # Determine slice indices (handle resize)
+                dh, dw = self.roi_shape
+                r_end, c_end = min(h, dh), min(w, dw)
+                
+                self.datacube[self.scan_index, :r_end, :c_end] = roi_slice[:r_end, :c_end]
+
+                if self.cube_t is not None:
+                    sl = get_roi_slice(img_t)
+                    self.cube_t[self.scan_index, :r_end, :c_end] = sl[:r_end, :c_end]
+                if self.cube_dt is not None:
+                    sl = get_roi_slice(img_dt)
+                    self.cube_dt[self.scan_index, :r_end, :c_end] = sl[:r_end, :c_end]
+                if self.cube_dtt is not None:
+                    sl = get_roi_slice(img_dtt)
+                    self.cube_dtt[self.scan_index, :r_end, :c_end] = sl[:r_end, :c_end]
+                if self.cube_raw_odd is not None:
+                    sl_odd = get_roi_slice(odd)
+                    sl_even = get_roi_slice(even)
+                    self.cube_raw_odd[self.scan_index, :r_end, :c_end] = sl_odd[:r_end, :c_end]
+                    self.cube_raw_even[self.scan_index, :r_end, :c_end] = sl_even[:r_end, :c_end]
 
                 print(f"[KSPACE] Point {self.scan_index+1}: "
                       f"{self.scan_positions[self.scan_index]:.3f} mm, "
@@ -865,7 +925,13 @@ class KSpaceWindow(QtWidgets.QWidget):
             os.makedirs(os.path.dirname(self.scan_npz_path), exist_ok=True)
             np.savez(self.scan_npz_path,
                      positions=self.scan_positions,
-                     datacube=self.datacube)
+                     datacube=self.datacube,
+                     # Selective
+                     data_t=self.cube_t if self.cube_t is not None else np.array([]),
+                     data_dt=self.cube_dt if self.cube_dt is not None else np.array([]),
+                     data_dtt=self.cube_dtt if self.cube_dtt is not None else np.array([]),
+                     raw_odd=self.cube_raw_odd if self.cube_raw_odd is not None else np.array([]),
+                     raw_even=self.cube_raw_even if self.cube_raw_even is not None else np.array([]))
             print(f"[KSPACE] Auto-saved raw: {self.scan_npz_path}")
 
             # Auto-compute

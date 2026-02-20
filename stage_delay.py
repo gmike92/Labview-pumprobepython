@@ -75,6 +75,9 @@ class DelayStageDriver:
         # Default serial number for probe delay line (from lab notes)
         self.DEFAULT_SERIAL = "45835224"
         
+        # Shared Zero Position (Global)
+        self.zero_position = 140.0
+        
         self._initialized = True
         print("[DelayStageDriver] Singleton initialized")
     
@@ -166,11 +169,16 @@ class DelayStageDriver:
                 r"C:\Users\mguizzardi\Desktop\Camera python\TWINS FILE\Twins\APT dll",
                 os.path.join(os.path.dirname(__file__), "..", "TWINS FILE", "Twins", "APT dll"),
                 os.path.join(os.path.dirname(__file__), "APT dll"),
+                r"C:\Program Files\Thorlabs\Kinesis",
             ]
             
             for apt_path in apt_dll_paths:
                 if os.path.exists(apt_path) and apt_path not in sys.path:
                     sys.path.insert(0, apt_path)
+                    if hasattr(os, "add_dll_directory"):
+                        os.add_dll_directory(apt_path)
+                    # Add to PATH for ctypes.util.find_library
+                    os.environ["PATH"] = apt_path + os.pathsep + os.environ["PATH"]
                     print(f"[INFO] Added APT DLL path: {apt_path}")
                     break
             

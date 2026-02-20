@@ -364,21 +364,41 @@ class TwinsWindow(QtWidgets.QWidget):
 
         control_layout.addWidget(proc_settings)
         
-        # Save Mode
-        save_mode_group = QtWidgets.QGroupBox("Data Saving")
-        save_mode_layout = QtWidgets.QHBoxLayout(save_mode_group)
-        save_mode_layout.addWidget(QtWidgets.QLabel("Mode:"))
+        # Save Configure
+        save_mode_group = QtWidgets.QGroupBox("Data Configuration")
+        save_mode_layout = QtWidgets.QVBoxLayout(save_mode_group)
+        
+        # Row 1: Combos
+        combo_row = QtWidgets.QHBoxLayout()
+        combo_row.addWidget(QtWidgets.QLabel("ROI Mode:"))
         self.cmb_save_mode = QtWidgets.QComboBox()
         self.cmb_save_mode.addItems(["Single Pixel", "ROI Average", "ROI (2D)", "Full Frame (2D)"])
         self.cmb_save_mode.setCurrentIndex(1) # Default ROI Avg
-        save_mode_layout.addWidget(self.cmb_save_mode)
+        combo_row.addWidget(self.cmb_save_mode)
         
-        # Plot Mode
-        save_mode_layout.addWidget(QtWidgets.QLabel("Plot Mode:"))
+        combo_row.addWidget(QtWidgets.QLabel("Plot:"))
         self.cmb_plot_mode = QtWidgets.QComboBox()
         self.cmb_plot_mode.addItems(["DeltaT (dT/T)", "Transmission (T)", "DeltaT (dT)"])
         self.cmb_plot_mode.setCurrentIndex(0) # Default dT/T
-        save_mode_layout.addWidget(self.cmb_plot_mode)
+        combo_row.addWidget(self.cmb_plot_mode)
+        
+        save_mode_layout.addLayout(combo_row)
+        
+        # Row 2: Checkboxes
+        check_row = QtWidgets.QHBoxLayout()
+        self.chk_save_t = QtWidgets.QCheckBox("Save T")
+        self.chk_save_dt = QtWidgets.QCheckBox("Save dT")
+        self.chk_save_dtt = QtWidgets.QCheckBox("Save dT/T")
+        self.chk_save_raw = QtWidgets.QCheckBox("Save Raw")
+        # Default
+        self.chk_save_dtt.setChecked(True)
+        
+        check_row.addWidget(self.chk_save_t)
+        check_row.addWidget(self.chk_save_dt)
+        check_row.addWidget(self.chk_save_dtt)
+        check_row.addWidget(self.chk_save_raw)
+        
+        save_mode_layout.addLayout(check_row)
 
         self.btn_bg = QtWidgets.QPushButton("Acquire Background")
         self.btn_bg.setStyleSheet("background-color: #607D8B; color: white;")
@@ -641,6 +661,14 @@ class TwinsWindow(QtWidgets.QWidget):
         self.scan_positions = np.linspace(start, stop, n_steps)
         self.interferogram = np.zeros(n_steps)
         self.roi_datacube = []  # list of 2D ROI slices per point
+        
+        # Selective Lists
+        self.data_t = []
+        self.data_dt = []
+        self.data_dtt = []
+        self.raw_odd = []
+        self.raw_even = []
+        
         self.scan_index = 0
 
         # Generate Standardized Paths
@@ -785,47 +813,72 @@ class TwinsWindow(QtWidgets.QWidget):
                 
                 # Handle Background
                 if hasattr(self, '_awaiting_background') and self._awaiting_background:
-                    self.manager.background = (odd + even) / 2.0
+                    # Store BOTH Odd and Even for Scattering Correction
+                    self.manager.background = (odd.copy(), even.copy())
                     self._awaiting_background = False
-                    self.lbl_status.setText("Global Background Acquired")
-                    QtWidgets.QMessageBox.information(self, "Background", "Global Background acquired!")
+                    self.lbl_status.setText("Global Background Acquired (Scattering Mode)")
+                    QtWidgets.QMessageBox.information(self, "Background", "Global Background acquired! (Odd/Even stored separately)")
                     return
 
                 # Apply Background
-                if self.manager.background is not None:
-                    if self.manager.background.shape == odd.shape:
-                        odd -= self.manager.background
-                        even -= self.manager.background
+                # Apply Background
+                bg = self.manager.background
+                if bg is not None:
+                    # New Mode: Tuple
+                    if isinstance(bg, (tuple, list)) and len(bg) == 2:
+                        bg_odd, bg_even = bg
+                        if bg_odd.shape == odd.shape and bg_even.shape == even.shape:
+                            odd -= bg_odd
+                            even -= bg_even
+                    # Legacy
+                    elif hasattr(bg, 'shape') and bg.shape == odd.shape:
+                        odd -= bg
+                        even -= bg
                 
-                # Compute based on Plot Mode
+                # Compute All
+                img_t = (odd + even) / 2.0
+                img_dt = even - odd
+                img_dtt = np.divide(even - odd, odd, out=np.zeros_like(odd), where=np.abs(odd) > 1.0)
                 
                 # Compute based on Plot Mode
                 pmode = self.cmb_plot_mode.currentIndex()
-                if pmode == 1:   # Transmission (T)
-                    img = (odd + even) / 2.0
-                elif pmode == 2: # DeltaT (dT)
-                    img = even - odd
-                else:            # DeltaT/T
-                    img = np.divide(even - odd, odd, out=np.zeros_like(odd), where=np.abs(odd) > 1.0)
-                if img.size == 0:
-                    print(f"[TWINS] Empty data at point {self.scan_index+1}")
-                    self.scan_index += 1
-                    QtCore.QTimer.singleShot(50, self._move_to_next)
-                    return
+                if pmode == 1:   img = img_t
+                elif pmode == 2: img = img_dt
+                else:            img = img_dtt
+                
+                # Extract Signal for Plot
+                val = self._extract(img)
+                self.interferogram[self.scan_index] = val
+                
+                # Update Interferogram Plot
+                if self.scan_index > 0:
+                     self.curve_interf.setData(
+                         self.scan_positions[:self.scan_index+1],
+                         self.interferogram[:self.scan_index+1]
+                     )
 
-                signal = self._extract(img)
-                self.interferogram[self.scan_index] = signal
+                # Store Selective Data
+                # Use _extract_to_save to get ROI/Pixel/Full
+                if self.chk_save_t.isChecked():
+                    self.data_t.append(self._extract_to_save(img_t))
+                if self.chk_save_dt.isChecked():
+                    self.data_dt.append(self._extract_to_save(img_dt))
+                if self.chk_save_dtt.isChecked():
+                    self.data_dtt.append(self._extract_to_save(img_dtt))
+                if self.chk_save_raw.isChecked():
+                    self.raw_odd.append(self._extract_to_save(odd))
+                    self.raw_even.append(self._extract_to_save(even))
 
-                # Store full ROI slice
-                to_save = self._extract_to_save(img)
-                self.roi_datacube.append(to_save)
-
-                # Update interferogram plot (partial)
-                idx = self.scan_index + 1
-                self.curve_interf.setData(
-                    self.scan_positions[:idx], self.interferogram[:idx]
-                )
-
+                # Legacy ROI datacube (stores whatever is plotted/selected? Or just img?)
+                # Original code didn't append to roi_datacube in _poll_acquire?!
+                # Wait, looking at sub_twins_lw.py lines 643... it inits roi_datacube=[]
+                # But where is it appended?
+                # I don't see it appended in the viewed code!
+                # Maybe I should append 'img' (selected mode) to roi_datacube for backward compat?
+                self.roi_datacube.append(self._extract_to_save(img))
+                
+                print(f"[TWINS] Point {self.scan_index+1}: {pos_mm:.3f} mm, val={val:.4e}")
+                
                 # CSV append
                 try:
                     actual_mm = self.stage.get_position()
@@ -860,21 +913,27 @@ class TwinsWindow(QtWidgets.QWidget):
         # Auto-compute spectrum
         self._compute_spectrum()
 
-        # Save final npy
+        # Save final npz
         if self.scan_csv_path:
-            if not hasattr(self, 'scan_npy_path'):
-                self.scan_npy_path = self.scan_csv_path.replace('.csv', '.npy')
-                
+            # Change extension to .npz
+            npz_path = self.scan_csv_path.replace('.csv', '.npz')
+            
             save_dict = {
                 'positions': self.scan_positions,
                 'interferogram': self.interferogram,
                 'wavelengths': self.wavelengths,
                 'spectrum': self.spectrum,
+                'roi_datacube': np.array(self.roi_datacube) if self.roi_datacube else np.array([]),
+                # Selective
+                'data_t': np.array(self.data_t) if hasattr(self,'data_t') and self.data_t else np.array([]),
+                'data_dt': np.array(self.data_dt) if hasattr(self,'data_dt') and self.data_dt else np.array([]),
+                'data_dtt': np.array(self.data_dtt) if hasattr(self,'data_dtt') and self.data_dtt else np.array([]),
+                'raw_odd': np.array(self.raw_odd) if hasattr(self,'raw_odd') and self.raw_odd else np.array([]),
+                'raw_even': np.array(self.raw_even) if hasattr(self,'raw_even') and self.raw_even else np.array([])
             }
-            if self.roi_datacube:
-                save_dict['roi_datacube'] = np.array(self.roi_datacube)
-            np.save(self.scan_npy_path, save_dict)
-            print(f"[TWINS] Saved final npy: {self.scan_npy_path}")
+
+            np.savez(npz_path, **save_dict)
+            print(f"[TWINS] Saved final npz: {npz_path}")
 
     # =========================================================================
     #  Spectrum Processing
