@@ -36,9 +36,9 @@ from labview_manager import LabVIEWManager, CMD_IDLE, CMD_MEASURE
 # Default Parameters
 # ============================================================================
 
-DEFAULT_START_MM = 15.0     # Default start position (mm)
-DEFAULT_STOP_MM = 23.0      # Default stop position (mm)
-DEFAULT_N_STEPS = 100       # Default number of steps
+DEFAULT_START_MM = 23.8     # Default start position (mm)
+DEFAULT_STOP_MM = 24.8      # Default stop position (mm)
+DEFAULT_N_STEPS = 120       # Default number of steps
 DEFAULT_APODIZATION = 0.2   # Apodization width
 DEFAULT_WL_START = 8.0      # Spectrum display start (µm)
 DEFAULT_WL_STOP = 14.0      # Spectrum display stop (µm)
@@ -111,9 +111,18 @@ class SpectrumProcessor:
 
     def apodization(self, data, positions, width=0.2):
         """Apply Gaussian apodization window (NIREOS formula)."""
-        center_idx = np.argmin(np.abs(positions))
-        left_pos = positions[:center_idx + 1]
-        right_pos = positions[center_idx + 1:]
+        center_idx = np.argmax(np.abs(data))
+        
+        try:
+            print(f"[SpectrumProcessor] Computed ZERO (burst center): {positions[center_idx]:.4f} mm (index {center_idx})")
+        except:
+            pass
+            
+        # Shift positions so that center burst is mathematically exactly 0
+        shifted_positions = positions - positions[center_idx]
+            
+        left_pos = shifted_positions[:center_idx + 1]
+        right_pos = shifted_positions[center_idx + 1:]
 
         if len(left_pos) > 0 and left_pos[0] != 0:
             left_gauss = np.exp(-np.power(left_pos, 2) /
@@ -160,7 +169,7 @@ class SpectrumProcessor:
             return 1.0 / frequencies
 
     def compute_spectrum(self, wl_start=8.0, wl_stop=14.0,
-                         apod_width=0.2, n_points=10000):
+                         apod_width=0.2, n_points=10000, invert=False, symmetrize=False):
         """Compute spectrum from interferogram using DFT."""
         if self.interferogram is None or self.positions is None:
             return None, None
@@ -169,13 +178,41 @@ class SpectrumProcessor:
         baseline = self.moving_average(self.interferogram, window_size)
         signal = self.interferogram - baseline
 
-        apodized = self.apodization(signal, self.positions, apod_width)
+        if invert:
+            signal = -signal
+
+        c_positions = self.positions
+        
+        if symmetrize:
+            c_idx = np.argmax(np.abs(signal))
+            left_len = c_idx
+            right_len = len(signal) - 1 - c_idx
+            
+            if right_len > left_len:
+                tail = signal[c_idx + 1:]
+                sym_signal = np.concatenate([tail[::-1], [signal[c_idx]], tail])
+                pos_diffs = c_positions[c_idx + 1:] - c_positions[c_idx]
+                mirrored_pos = c_positions[c_idx] - pos_diffs[::-1]
+                sym_positions = np.concatenate([mirrored_pos, [c_positions[c_idx]], c_positions[c_idx + 1:]])
+            else:
+                tail = signal[:c_idx]
+                sym_signal = np.concatenate([tail, [signal[c_idx]], tail[::-1]])
+                pos_diffs = c_positions[c_idx] - c_positions[:c_idx]
+                mirrored_pos = c_positions[c_idx] + pos_diffs[::-1]
+                sym_positions = np.concatenate([c_positions[:c_idx], [c_positions[c_idx]], mirrored_pos])
+            
+            signal = sym_signal
+            c_positions = sym_positions
+            self.center_idx = len(signal) // 2
+
+        self.symmetrized_signal = signal
+        apodized = self.apodization(signal, c_positions, apod_width)
 
         start_freq, end_freq = self._get_frequency_limits(wl_start, wl_stop)
-        frequencies = np.linspace(start_freq, end_freq, n_points)
+        frequencies = np.linspace(end_freq, start_freq, n_points)
 
-        pos = self.positions.reshape(-1, 1)
-        dpos = np.diff(self.positions)
+        pos = c_positions.reshape(-1, 1)
+        dpos = np.diff(c_positions)
         dpos = np.append(dpos, dpos[-1] if len(dpos) > 0 else 0)
 
         phase = -2j * np.pi * pos * frequencies
@@ -187,6 +224,8 @@ class SpectrumProcessor:
         self.freq = frequencies
         self.wavelengths = wavelengths
         self.spectrum = spectrum
+        self.apodized_signal = apodized
+        self.apodized_positions = c_positions
 
         return wavelengths, spectrum
 
@@ -360,7 +399,15 @@ class TwinsWindow(QtWidgets.QWidget):
         self.spin_apod.setRange(0.01, 5.0)
         self.spin_apod.setValue(0.2)
         self.spin_apod.setSingleStep(0.1)
-        proc_layout.addWidget(self.spin_apod, 3, 1) # FIXED: was 0,1 which overwrote label? No, 2, 1.
+        proc_layout.addWidget(self.spin_apod, 3, 1)
+
+        self.chk_invert_ifg = QtWidgets.QCheckBox("Invert IFG (+45/-45)")
+        self.chk_invert_ifg.setChecked(False)
+        proc_layout.addWidget(self.chk_invert_ifg, 4, 0, 1, 2)
+
+        self.chk_asymmetric = QtWidgets.QCheckBox("Asymmetric Scan (Symmetrize)")
+        self.chk_asymmetric.setChecked(False)
+        proc_layout.addWidget(self.chk_asymmetric, 5, 0, 1, 2)
 
         control_layout.addWidget(proc_settings)
         
@@ -379,10 +426,51 @@ class TwinsWindow(QtWidgets.QWidget):
         combo_row.addWidget(QtWidgets.QLabel("Plot:"))
         self.cmb_plot_mode = QtWidgets.QComboBox()
         self.cmb_plot_mode.addItems(["DeltaT (dT/T)", "Transmission (T)", "DeltaT (dT)"])
-        self.cmb_plot_mode.setCurrentIndex(0) # Default dT/T
+        self.cmb_plot_mode.setCurrentIndex(1) # Default to Transmission (T)
         combo_row.addWidget(self.cmb_plot_mode)
         
         save_mode_layout.addLayout(combo_row)
+        
+        # Load and bind QSettings
+        self._settings = QtCore.QSettings('Polimi', 'HybridCamera')
+        
+        # Load values
+        try:
+            self.spin_start.setValue(float(self._settings.value('twins_start', self.spin_start.value())))
+            self.spin_stop.setValue(float(self._settings.value('twins_stop', self.spin_stop.value())))
+            self.spin_n_steps.setValue(int(self._settings.value('twins_steps', self.spin_n_steps.value())))
+            self.spin_wl_start.setValue(float(self._settings.value('twins_wl_start', self.spin_wl_start.value())))
+            self.spin_wl_stop.setValue(float(self._settings.value('twins_wl_stop', self.spin_wl_stop.value())))
+            self.spin_n_points.setValue(int(self._settings.value('twins_n_points', self.spin_n_points.value())))
+            self.spin_apod.setValue(float(self._settings.value('twins_apod', self.spin_apod.value())))
+            self.chk_invert_ifg.setChecked(str(self._settings.value('twins_invert_ifg', self.chk_invert_ifg.isChecked())).lower() == 'true')
+            self.chk_asymmetric.setChecked(str(self._settings.value('twins_asymmetric', self.chk_asymmetric.isChecked())).lower() == 'true')
+            self.txt_sample_name.setText(str(self._settings.value('twins_sample_name', self.txt_sample_name.text())))
+        except Exception:
+            pass
+            
+        def save_settings(*args):
+            self._settings.setValue('twins_start', self.spin_start.value())
+            self._settings.setValue('twins_stop', self.spin_stop.value())
+            self._settings.setValue('twins_steps', self.spin_n_steps.value())
+            self._settings.setValue('twins_wl_start', self.spin_wl_start.value())
+            self._settings.setValue('twins_wl_stop', self.spin_wl_stop.value())
+            self._settings.setValue('twins_n_points', self.spin_n_points.value())
+            self._settings.setValue('twins_apod', self.spin_apod.value())
+            self._settings.setValue('twins_invert_ifg', self.chk_invert_ifg.isChecked())
+            self._settings.setValue('twins_asymmetric', self.chk_asymmetric.isChecked())
+            self._settings.setValue('twins_sample_name', self.txt_sample_name.text())
+            
+        self.spin_start.valueChanged.connect(save_settings)
+        self.spin_stop.valueChanged.connect(save_settings)
+        self.spin_n_steps.valueChanged.connect(save_settings)
+        self.spin_wl_start.valueChanged.connect(save_settings)
+        self.spin_wl_stop.valueChanged.connect(save_settings)
+        self.spin_n_points.valueChanged.connect(save_settings)
+        self.spin_apod.valueChanged.connect(save_settings)
+        self.chk_invert_ifg.toggled.connect(save_settings)
+        self.chk_asymmetric.toggled.connect(save_settings)
+        self.txt_sample_name.textChanged.connect(save_settings)
         
         # Row 2: Checkboxes
         check_row = QtWidgets.QHBoxLayout()
@@ -503,7 +591,9 @@ class TwinsWindow(QtWidgets.QWidget):
         self.plot_interf.setLabel('left', 'Intensity (mean ΔT/T)')
         self.plot_interf.setLabel('bottom', 'Position (mm)')
         self.plot_interf.showGrid(x=True, y=True, alpha=0.3)
-        self.curve_interf = self.plot_interf.plot(pen='y')
+        self.curve_interf = self.plot_interf.plot(pen='y', name="Raw IFG")
+        self.curve_sym = self.plot_interf.plot(pen='c', name="Symmetric IFG")
+        self.curve_apod = self.plot_interf.plot(pen='r', name="Apodized IFG")
         interf_layout.addWidget(self.plot_interf)
 
         plot_splitter.addWidget(interf_widget)
@@ -838,7 +928,7 @@ class TwinsWindow(QtWidgets.QWidget):
                 # Compute All
                 img_t = (odd + even) / 2.0
                 img_dt = even - odd
-                img_dtt = np.divide(even - odd, odd, out=np.zeros_like(odd), where=np.abs(odd) > 1.0)
+                img_dtt = np.divide(even - odd, odd, out=np.zeros_like(odd), where=np.abs(odd) > 1.0) * 100.0
                 
                 # Compute based on Plot Mode
                 pmode = self.cmb_plot_mode.currentIndex()
@@ -886,9 +976,9 @@ class TwinsWindow(QtWidgets.QWidget):
                     actual_mm = pos_mm
                 with open(self.scan_csv_path, 'a', newline='') as f:
                     writer = csv.writer(f)
-                    writer.writerow([f"{pos_mm:.4f}", f"{actual_mm:.4f}", f"{signal:.8e}"])
+                    writer.writerow([f"{pos_mm:.4f}", f"{actual_mm:.4f}", f"{val:.8e}"])
 
-                print(f"[TWINS] Point {self.scan_index+1}: {pos_mm:.3f} mm = {signal:.4e}")
+                print(f"[TWINS] Point {self.scan_index+1}: {pos_mm:.3f} mm = {val:.4e}")
             else:
                 print(f"[TWINS] No data at point {self.scan_index+1}")
 
@@ -945,18 +1035,40 @@ class TwinsWindow(QtWidgets.QWidget):
             return
 
         self.lbl_status.setText("Computing spectrum...")
-        self.processor.set_data(self.scan_positions, self.interferogram)
+        try:
+            self.processor.set_data(self.scan_positions, self.interferogram)
+        except AttributeError:
+            self.processor.positions = self.scan_positions
+            self.processor.interferogram = self.interferogram
+        
+        sym_flag = hasattr(self, 'chk_asymmetric') and self.chk_asymmetric.isChecked()
+
         wavelengths, spectrum = self.processor.compute_spectrum(
             wl_start=self.spin_wl_start.value(),
             wl_stop=self.spin_wl_stop.value(),
             apod_width=self.spin_apod.value(),
-            n_points=self.spin_n_points.value()
+            n_points=self.spin_n_points.value(),
+            invert=self.chk_invert_ifg.isChecked(),
+            symmetrize=sym_flag
         )
 
         if wavelengths is not None and spectrum is not None:
             self.wavelengths = wavelengths
             self.spectrum = spectrum
             self.curve_spec.setData(wavelengths, spectrum)
+            
+            apod_pos = getattr(self.processor, 'apodized_positions', self.scan_positions)
+            
+            if sym_flag and hasattr(self.processor, 'symmetrized_signal'):
+                self.curve_sym.setData(apod_pos, self.processor.symmetrized_signal)
+                self.curve_sym.setVisible(True)
+            else:
+                self.curve_sym.setData([], [])
+                self.curve_sym.setVisible(False)
+            
+            if hasattr(self.processor, 'apodized_signal') and self.processor.apodized_signal is not None:
+                self.curve_apod.setData(apod_pos, self.processor.apodized_signal)
+                
             self.lbl_status.setText("Spectrum computed!")
         else:
             self.lbl_status.setText("Spectrum computation failed")

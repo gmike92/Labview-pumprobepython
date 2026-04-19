@@ -199,7 +199,7 @@ class PumpProbeScanWindow(QtWidgets.QWidget):
         acq_layout.addWidget(QtWidgets.QLabel("Plot Mode:"), 4, 0)
         self.cmb_plot_mode = QtWidgets.QComboBox()
         self.cmb_plot_mode.addItems(["DeltaT (dT/T)", "Transmission (T)", "DeltaT (dT)"])
-        self.cmb_plot_mode.setCurrentIndex(0) # Default dT/T
+        self.cmb_plot_mode.setCurrentIndex(1) # Default Transmission (T)
         acq_layout.addWidget(self.cmb_plot_mode, 4, 1)
 
         # Data Saving Group
@@ -208,7 +208,7 @@ class PumpProbeScanWindow(QtWidgets.QWidget):
         
         self.chk_save_t = QtWidgets.QCheckBox("Transmission (T)")
         self.chk_save_dt = QtWidgets.QCheckBox("DeltaT (dT)")
-        self.chk_save_dtt = QtWidgets.QCheckBox("DeltaT/T")
+        self.chk_save_dtt = QtWidgets.QCheckBox("DeltaT/T (%)")
         self.chk_save_raw = QtWidgets.QCheckBox("Raw (Odd/Even)")
         
         # Defaults: dT/T on? Or user chooses? 
@@ -339,7 +339,7 @@ class PumpProbeScanWindow(QtWidgets.QWidget):
 
         # Camera frame
         cam_widget = pg.GraphicsLayoutWidget()
-        self.img_view = cam_widget.addPlot(title="Last Acquired Frame (DeltaT/T)")
+        self.img_view = cam_widget.addPlot(title="Last Acquired Frame (DeltaT/T %)")
         self.img_item = pg.ImageItem()
         self.img_view.addItem(self.img_item)
 
@@ -361,8 +361,8 @@ class PumpProbeScanWindow(QtWidgets.QWidget):
 
         # Scan plot
         self.scan_plot = pg.PlotWidget(
-            title="DeltaT/T vs Delay",
-            labels={'left': 'DeltaT/T (mean)', 'bottom': 'Delay (fs)'}
+            title="DeltaT/T (%) vs Delay",
+            labels={'left': 'DeltaT/T (%) (mean)', 'bottom': 'Delay (fs)'}
         )
         self.scan_plot.showGrid(x=True, y=True, alpha=0.3)
         self.scan_curve = self.scan_plot.plot(
@@ -629,6 +629,7 @@ class PumpProbeScanWindow(QtWidgets.QWidget):
         self.scan_curve.setData([], [])
         
         # Data Storage
+        self.roi_datacube = []    # CLEAR datacube!
         self.data_t = []
         self.data_dt = []
         self.data_dtt = []
@@ -696,6 +697,7 @@ class PumpProbeScanWindow(QtWidgets.QWidget):
         delay_fs = self.scan_points_fs[self.scan_index]
         zero_mm = self.zero_spin.value()
         target_mm = zero_mm + self._fs_to_mm(delay_fs)
+        self._current_target_mm = target_mm
         
         self.status_label.setText(
             f"Status: Point {self.scan_index+1}/{len(self.scan_points_fs)}: "
@@ -731,9 +733,9 @@ class PumpProbeScanWindow(QtWidgets.QWidget):
         pos = self.delay_stage.get_position()
         self.stage_label.setText(f"Stage: {pos:.4f} mm")
         
-        # 3 consecutive reads within 1µm = stable
+        # 3 consecutive reads within 1µm = stable, AND must be near target
         if self._last_pos is not None:
-            if abs(pos - self._last_pos) < 0.001:
+            if abs(pos - self._last_pos) < 0.001 and abs(pos - getattr(self, '_current_target_mm', pos)) < 0.002:
                 self._stable += 1
                 if self._stable >= 3:
                     self._poll_timer.stop()
@@ -830,7 +832,7 @@ class PumpProbeScanWindow(QtWidgets.QWidget):
                 # Compute All Forms
                 img_t = (odd + even) / 2.0
                 img_dt = even - odd
-                img_dtt = np.divide(even - odd, odd, out=np.zeros_like(odd), where=np.abs(odd) > 1.0)
+                img_dtt = np.divide(even - odd, odd, out=np.zeros_like(odd), where=np.abs(odd) > 1.0) * 100.0
                 
                 # Plot choice
                 pmode = self.cmb_plot_mode.currentIndex()

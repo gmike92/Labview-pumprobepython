@@ -116,6 +116,7 @@ class LiveViewWindow(QtWidgets.QWidget):
         ctrl_layout.addWidget(QtWidgets.QLabel("Mode:"), 0, 4)
         self.mode_combo = QtWidgets.QComboBox()
         self.mode_combo.addItems(["ΔT/T (dT)", "Transmission (T)", "DeltaT (dT)", "Even (Pump On)"])
+        self.mode_combo.setCurrentIndex(1) # Default to Transmission (T)
         self.mode_combo.currentIndexChanged.connect(self._change_mode)
         ctrl_layout.addWidget(self.mode_combo, 0, 5)
         

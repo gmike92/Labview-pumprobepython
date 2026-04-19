@@ -73,7 +73,8 @@ class DelayStageDriver:
         self.COUNTS_PER_MM = 20000
         
         # Default serial number for probe delay line (from lab notes)
-        self.DEFAULT_SERIAL = "45835224"
+        self.DEFAULT_SERIAL = "45835224" # regular delay line
+        self.DEFAULT_SERIAL_TWINS = "73203584" # old delay line
         
         # Shared Zero Position (Global)
         self.zero_position = 140.0

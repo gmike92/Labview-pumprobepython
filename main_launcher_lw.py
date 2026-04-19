@@ -98,6 +98,7 @@ class MainLauncher(QtWidgets.QWidget):
         self.twins_pp_window = None
         self.deltat_window = None
         self.kspace_window = None
+        self.lockin_pp_window = None
         
         self.setWindowTitle("LabVIEW Hybrid Camera — Main Launcher")
         self.setMinimumSize(460, 500)
@@ -257,6 +258,15 @@ class MainLauncher(QtWidgets.QWidget):
         )
         self.kspace_btn.clicked.connect(self._open_kspace)
         launch_layout.addWidget(self.kspace_btn)
+        
+
+        self.lockin_pp_btn = QtWidgets.QPushButton("🔬 Lock-In Pump-Probe")
+        self.lockin_pp_btn.setStyleSheet(
+            "background-color: #795548; color: white; font-weight: bold; "
+            "font-size: 14px; padding: 12px;"
+        )
+        self.lockin_pp_btn.clicked.connect(self._open_lockin_pp)
+        launch_layout.addWidget(self.lockin_pp_btn)
         
         # =================================================================
         # Log
@@ -469,6 +479,17 @@ class MainLauncher(QtWidgets.QWidget):
         self.kspace_window.show()
         self.kspace_window.raise_()
         self._log("Opened K-Space Hyperspectral window")
+        
+
+    def _open_lockin_pp(self):
+        from sub_lockin_pumpprobe_lw import LockInPumpProbeWindow
+        
+        if self.lockin_pp_window is None or not self.lockin_pp_window.isVisible():
+            self.lockin_pp_window = LockInPumpProbeWindow(delay_stage=self.delay_stage)
+        self.lockin_pp_window.show()
+        self.lockin_pp_window.raise_()
+        self._log("Opened Lock-In Pump-Probe window")
+        
     
     # =========================================================================
     # Cleanup
@@ -489,6 +510,8 @@ class MainLauncher(QtWidgets.QWidget):
             self.deltat_window.close()
         if self.kspace_window:
             self.kspace_window.close()
+        if self.lockin_pp_window:
+            self.lockin_pp_window.close()
         
         # Disconnect stages
         if self.delay_stage and self.delay_stage.is_connected:

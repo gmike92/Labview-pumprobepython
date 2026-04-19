@@ -101,9 +101,10 @@ class HyperspectralProcessor:
 
     def compute_hyperspectral(self, positions, datacube,
                                wl_start=8.0, wl_stop=14.0,
-                               apod_width=0.2, n_freq=200):
+                               apod_width=0.2, n_freq=200, reference_cube=None, invert=False):
         """
         Compute per-pixel DFT on a (n_pos, h, w) datacube.
+        If reference_cube is provided, extracts spectral phase and returns the Absorptive (Real) part.
 
         Returns:
             wavelengths : 1D array (n_freq,)
@@ -112,49 +113,100 @@ class HyperspectralProcessor:
         n_pos, h, w = datacube.shape
         if n_pos < 3:
             return None, None
+            
+        if invert:
+            datacube = -datacube
+            if reference_cube is not None:
+                reference_cube = -reference_cube
 
-        # Baseline removal: subtract per-pixel moving average
-        window = max(1, n_pos // 5)
-        kernel = np.ones(window) / window
-        baseline = np.zeros_like(datacube)
-        for r in range(h):
-            for c in range(w):
-                baseline[:, r, c] = np.convolve(
-                    datacube[:, r, c], kernel, mode='same'
-                )
-        signal = datacube - baseline
+        sym_flag = hasattr(self, 'chk_asymmetric') and self.chk_asymmetric.isChecked()
+        
+        # Helper for baseline & apodization
+        def preprocess(cube, force_center_idx=None, c_pos=None):
+            if c_pos is None:
+                c_pos = positions
 
-        # Apodization (Gaussian window along position axis, same for all pixels)
-        center_idx = n_pos // 2
-        sigma = abs(positions[-1] - positions[0]) * apod_width
-        if sigma > 0:
-            apod_window = np.exp(-(positions - positions[center_idx])**2
-                                  / (2.0 * sigma**2))
+            window = max(1, len(c_pos) // 5)
+            from scipy.ndimage import uniform_filter1d
+            baseline = uniform_filter1d(cube, size=window, axis=0, mode='constant', cval=0.0)
+            sig = cube - baseline
+            
+            if force_center_idx is not None:
+                center_idx = force_center_idx
+            else:
+                # Find the center dynamically by integrating the absolute signal across the whole camera spatial frame
+                center_idx = int(np.argmax(np.sum(np.abs(sig), axis=(1, 2))))
+                
+            if sym_flag:
+                left_len = center_idx
+                right_len = len(sig) - 1 - center_idx
+                
+                if right_len > left_len:
+                    tail = sig[center_idx + 1:]
+                    sym_signal = np.concatenate([tail[::-1], sig[center_idx:center_idx+1], tail], axis=0)
+                    pos_diffs = c_pos[center_idx + 1:] - c_pos[center_idx]
+                    mirrored_pos = c_pos[center_idx] - pos_diffs[::-1]
+                    sym_positions = np.concatenate([mirrored_pos, [c_pos[center_idx]], c_pos[center_idx + 1:]])
+                else:
+                    tail = sig[:center_idx]
+                    sym_signal = np.concatenate([tail, sig[center_idx:center_idx+1], tail[::-1]], axis=0)
+                    pos_diffs = c_pos[center_idx] - c_pos[:center_idx]
+                    mirrored_pos = c_pos[center_idx] + pos_diffs[::-1]
+                    sym_positions = np.concatenate([c_pos[:center_idx], [c_pos[center_idx]], mirrored_pos])
+                    
+                sig = sym_signal
+                c_pos = sym_positions
+                center_idx = len(sig) // 2
+            
+            try:
+                print(f"[K-Space PP] Computed ZERO (burst center): {c_pos[center_idx]:.4f} mm (index {center_idx})")
+            except:
+                pass
+                
+            sigma = abs(c_pos[-1] - c_pos[0]) * apod_width
+            if sigma > 0:
+                apod = np.exp(-(c_pos - c_pos[center_idx])**2 / (2.0 * sigma**2))
+            else:
+                apod = np.ones(len(c_pos))
+            return sig * apod[:, np.newaxis, np.newaxis], center_idx, c_pos
+
+        if reference_cube is not None:
+            ref_signal, fixed_center, ref_pos = preprocess(reference_cube)
+            signal, _, final_pos = preprocess(datacube, force_center_idx=fixed_center, c_pos=ref_pos)
         else:
-            apod_window = np.ones(n_pos)
-        # Apply: broadcast (n_pos,) over (n_pos, h, w)
-        signal = signal * apod_window[:, np.newaxis, np.newaxis]
+            signal, _, final_pos = preprocess(datacube)
 
         # Frequency grid
         start_freq, end_freq = self._get_frequency_limits(wl_start, wl_stop)
-        frequencies = np.linspace(start_freq, end_freq, n_freq)
+        # Generate frequencies in descending order so that wavelengths (which are inversely proportional) are ascending
+        frequencies = np.linspace(end_freq, start_freq, n_freq)
         wavelengths = self._freq_to_wavelength(frequencies)
 
         # DFT: for each frequency, sum over positions
         # phase: (n_pos, n_freq)
-        pos = positions.reshape(-1, 1)
-        dpos = np.diff(positions)
+        pos = final_pos.reshape(-1, 1)
+        dpos = np.diff(final_pos)
         dpos = np.append(dpos, dpos[-1] if len(dpos) > 0 else 0)
 
-        phase = np.exp(-2j * np.pi * pos * frequencies)  # (n_pos, n_freq)
-        weighted = signal * dpos[:, np.newaxis, np.newaxis]  # (n_pos, h, w)
+        phase_kernel = np.exp(-2j * np.pi * pos * frequencies)  # (n_pos, n_freq)
 
-        # Reshape for matrix multiply: (n_pos, h*w) @ phase would be wrong dim
-        # We want: for each freq f, spectrum[f, r, c] = sum_i weighted[i, r, c] * phase[i, f]
-        # Reshape weighted to (n_pos, h*w), then spectrum = phase.T @ weighted → (n_freq, h*w)
-        flat = weighted.reshape(n_pos, -1)     # (n_pos, h*w)
-        spec_flat = phase.conj().T @ flat      # (n_freq, h*w)
-        spectrum_cube = np.abs(spec_flat).reshape(n_freq, h, w)
+        n_pos_final = len(final_pos)
+        # DFT of signal
+        weighted = signal * dpos[:, np.newaxis, np.newaxis]  # (n_pos, h, w)
+        flat = weighted.reshape(n_pos_final, -1)     # (n_pos, h*w)
+        spec_flat = phase_kernel.conj().T @ flat  # (n_freq, h*w)
+        
+        # Phase correction
+        if reference_cube is not None:
+            ref_weighted = ref_signal * dpos[:, np.newaxis, np.newaxis]
+            ref_flat = ref_weighted.reshape(n_pos_final, -1)
+            ref_spec_flat = phase_kernel.conj().T @ ref_flat
+            
+            phase_correction = np.angle(ref_spec_flat)
+            phased_spec_flat = spec_flat * np.exp(-1j * phase_correction)
+            spectrum_cube = np.real(phased_spec_flat).reshape(n_freq, h, w)
+        else:
+            spectrum_cube = np.abs(spec_flat).reshape(n_freq, h, w)
 
         return wavelengths, spectrum_cube
 
@@ -306,8 +358,8 @@ class KSpaceWindow(QtWidgets.QWidget):
         # Plot Mode
         acq_gl.addWidget(QtWidgets.QLabel("Plot Mode:"), 2, 0)
         self.cmb_plot_mode = QtWidgets.QComboBox()
-        self.cmb_plot_mode.addItems(["DeltaT (dT/T)", "Transmission (T)", "DeltaT (dT)"])
-        self.cmb_plot_mode.setCurrentIndex(0) # Default dT/T
+        self.cmb_plot_mode.addItems(["DeltaT (dT/T) (%)", "Transmission (T)", "DeltaT (dT)"])
+        self.cmb_plot_mode.setCurrentIndex(1) # Default Transmission (T)
         acq_gl.addWidget(self.cmb_plot_mode, 2, 1)
 
         self.btn_bg = QtWidgets.QPushButton("Acquire Background")
@@ -324,7 +376,7 @@ class KSpaceWindow(QtWidgets.QWidget):
         save_layout = QtWidgets.QVBoxLayout(save_group)
         self.chk_save_t = QtWidgets.QCheckBox("Transmission (T)")
         self.chk_save_dt = QtWidgets.QCheckBox("DeltaT (dT)")
-        self.chk_save_dtt = QtWidgets.QCheckBox("DeltaT/T")
+        self.chk_save_dtt = QtWidgets.QCheckBox("DeltaT/T (%)")
         self.chk_save_raw = QtWidgets.QCheckBox("Raw (Odd/Even)")
         # Defaults
         self.chk_save_dtt.setChecked(True)
@@ -409,6 +461,18 @@ class KSpaceWindow(QtWidgets.QWidget):
         )
         self.btn_compute.clicked.connect(self._compute)
         proc_gl.addWidget(self.btn_compute, 4, 0, 1, 2)
+        
+        self.chk_phase_correction = QtWidgets.QCheckBox("Phase Correction (Use Odd Frames)")
+        self.chk_phase_correction.setChecked(True)
+        proc_gl.addWidget(self.chk_phase_correction, 5, 0, 1, 2)
+        
+        self.chk_invert_ifg = QtWidgets.QCheckBox("Invert IFG (+45/-45)")
+        self.chk_invert_ifg.setChecked(False)
+        proc_gl.addWidget(self.chk_invert_ifg, 6, 0, 1, 2)
+        
+        self.chk_asymmetric = QtWidgets.QCheckBox("Asymmetric Scan (Symmetrize)")
+        self.chk_asymmetric.setChecked(False)
+        proc_gl.addWidget(self.chk_asymmetric, 7, 0, 1, 2)
 
         ctrl_layout.addWidget(proc_group)
 
@@ -519,6 +583,45 @@ class KSpaceWindow(QtWidgets.QWidget):
         # Init
         self._update_info()
 
+        # QSettings integration for Twins configurations
+        self._settings = QtCore.QSettings('Polimi', 'HybridCamera')
+        try:
+            self.spin_start.setValue(float(self._settings.value('twins_start', self.spin_start.value())))
+            self.spin_stop.setValue(float(self._settings.value('twins_stop', self.spin_stop.value())))
+            self.spin_steps.setValue(int(self._settings.value('twins_steps', self.spin_steps.value())))
+            self.spin_wl_start.setValue(float(self._settings.value('twins_wl_start', self.spin_wl_start.value())))
+            self.spin_wl_stop.setValue(float(self._settings.value('twins_wl_stop', self.spin_wl_stop.value())))
+            self.spin_nfreq.setValue(int(self._settings.value('twins_n_points', self.spin_nfreq.value())))
+            self.spin_apod.setValue(float(self._settings.value('twins_apod', self.spin_apod.value())))
+            self.chk_invert_ifg.setChecked(str(self._settings.value('twins_invert_ifg', self.chk_invert_ifg.isChecked())).lower() == 'true')
+            self.chk_asymmetric.setChecked(str(self._settings.value('twins_asymmetric', self.chk_asymmetric.isChecked())).lower() == 'true')
+            self.txt_sample_name.setText(str(self._settings.value('twins_sample_name', self.txt_sample_name.text())))
+        except Exception:
+            pass
+            
+        def save_settings(*args):
+            self._settings.setValue('twins_start', self.spin_start.value())
+            self._settings.setValue('twins_stop', self.spin_stop.value())
+            self._settings.setValue('twins_steps', self.spin_steps.value())
+            self._settings.setValue('twins_wl_start', self.spin_wl_start.value())
+            self._settings.setValue('twins_wl_stop', self.spin_wl_stop.value())
+            self._settings.setValue('twins_n_points', self.spin_nfreq.value())
+            self._settings.setValue('twins_apod', self.spin_apod.value())
+            self._settings.setValue('twins_invert_ifg', self.chk_invert_ifg.isChecked())
+            self._settings.setValue('twins_asymmetric', self.chk_asymmetric.isChecked())
+            self._settings.setValue('twins_sample_name', self.txt_sample_name.text())
+            
+        self.spin_start.valueChanged.connect(save_settings)
+        self.spin_stop.valueChanged.connect(save_settings)
+        self.spin_steps.valueChanged.connect(save_settings)
+        self.spin_wl_start.valueChanged.connect(save_settings)
+        self.spin_wl_stop.valueChanged.connect(save_settings)
+        self.spin_nfreq.valueChanged.connect(save_settings)
+        self.spin_apod.valueChanged.connect(save_settings)
+        self.chk_invert_ifg.toggled.connect(save_settings)
+        self.chk_asymmetric.toggled.connect(save_settings)
+        self.txt_sample_name.textChanged.connect(save_settings)
+
     # =========================================================================
     #  Helpers
     # =========================================================================
@@ -567,7 +670,7 @@ class KSpaceWindow(QtWidgets.QWidget):
         QtCore.QTimer.singleShot(500, lambda: self.btn_move.setEnabled(True))
         QtCore.QTimer.singleShot(500, lambda: self.lbl_status.setText("Ready"))
 
-    def _extract_to_save(self, img):
+    def _extract_to_save(self, img, bounds=None):
         """Extract data entity to SAVE in datacube based on mode. Always returns 2D array."""
         mode = self.cmb_save_mode.currentIndex()
         # 0=Single, 1=ROI Avg, 2=ROI, 3=Full
@@ -590,7 +693,8 @@ class KSpaceWindow(QtWidgets.QWidget):
             
             # ROI modes
             if mode in [1, 2]:
-                bounds = self.live_window.get_roi_bounds()
+                if bounds is None:
+                    bounds = self.live_window.get_roi_bounds()
                 if bounds:
                     r0, r1, c0, c1 = bounds
                     h, w = img.shape
@@ -629,6 +733,7 @@ class KSpaceWindow(QtWidgets.QWidget):
         self.scan_index = 0
         self.datacube = None
         self.spectrum_cube = None
+        self.wavelengths = None
         self.roi_shape = None
         
         # Selective Cubes
@@ -695,6 +800,7 @@ class KSpaceWindow(QtWidgets.QWidget):
             return
 
         target = self.scan_positions[self.scan_index]
+        self._current_target_mm = target
         self.lbl_status.setText(
             f"Point {self.scan_index+1}/{len(self.scan_positions)}: "
             f"Moving to {target:.3f} mm"
@@ -733,7 +839,7 @@ class KSpaceWindow(QtWidgets.QWidget):
         except Exception:
             return
 
-        if self._last_pos is not None and abs(pos - self._last_pos) < 0.001:
+        if self._last_pos is not None and abs(pos - self._last_pos) < 0.001 and abs(pos - getattr(self, '_current_target_mm', pos)) < 0.002:
             self._stable_count += 1
         else:
             self._stable_count = 0
@@ -758,7 +864,10 @@ class KSpaceWindow(QtWidgets.QWidget):
             self._acq_timer = QtCore.QTimer()
             self._acq_timer.timeout.connect(self._poll_acquire)
             self._acq_waited = 0.0
-            self._acq_timer.start(50)
+            
+            # Wait N ms + 20ms buffer, then poll every 20ms to avoid freezing main thread with COM calls
+            wait_ms = n + 20
+            QtCore.QTimer.singleShot(wait_ms, lambda: self._acq_timer.start(20))
 
         except Exception as e:
             self.lbl_status.setText(f"Acquire error: {e}")
@@ -824,7 +933,7 @@ class KSpaceWindow(QtWidgets.QWidget):
                 # Compute All
                 img_t = (odd + even) / 2.0
                 img_dt = even - odd
-                img_dtt = np.divide(even - odd, odd, out=np.zeros_like(odd), where=np.abs(odd) > 1.0)
+                img_dtt = np.divide(even - odd, odd, out=np.zeros_like(odd), where=np.abs(odd) > 1.0) * 100.0
 
                 # Compute based on Plot Mode (for Display / Main Datacube)
                 pmode = self.cmb_plot_mode.currentIndex()
@@ -838,8 +947,11 @@ class KSpaceWindow(QtWidgets.QWidget):
                     return
 
                 # --- Helper to extract ROI slice ---
+                # Cache bounds once per frame to prevent 6x GUI blocking query overhead!
+                active_bounds = self.live_window.get_roi_bounds() if self.live_window else None
+                
                 def get_roi_slice(image):
-                    s = self._extract_to_save(image)
+                    s = self._extract_to_save(image, bounds=active_bounds)
                     if s.ndim == 0: s = np.array([[s]])
                     if s.ndim == 1: s = s.reshape(1, -1)
                     return s
@@ -881,10 +993,13 @@ class KSpaceWindow(QtWidgets.QWidget):
                 if self.cube_dtt is not None:
                     sl = get_roi_slice(img_dtt)
                     self.cube_dtt[self.scan_index, :r_end, :c_end] = sl[:r_end, :c_end]
-                if self.cube_raw_odd is not None:
-                    sl_odd = get_roi_slice(odd)
+                
+                # Always store raw odd frames internally to allow Phase extraction
+                sl_odd = get_roi_slice(odd)
+                self.cube_raw_odd[self.scan_index, :r_end, :c_end] = sl_odd[:r_end, :c_end]
+                
+                if self.cube_raw_even is not None:
                     sl_even = get_roi_slice(even)
-                    self.cube_raw_odd[self.scan_index, :r_end, :c_end] = sl_odd[:r_end, :c_end]
                     self.cube_raw_even[self.scan_index, :r_end, :c_end] = sl_even[:r_end, :c_end]
 
                 print(f"[KSPACE] Point {self.scan_index+1}: "
@@ -952,12 +1067,24 @@ class KSpaceWindow(QtWidgets.QWidget):
         QtCore.QTimer.singleShot(50, self._do_compute)
 
     def _do_compute(self):
+        # Phase Correction Option
+        ref_cube = None
+        if hasattr(self, 'chk_phase_correction') and self.chk_phase_correction.isChecked():
+            if hasattr(self, 'cube_raw_odd') and self.cube_raw_odd is not None:
+                # Use raw pump-off (odd) frames as reference
+                ref_cube = self.cube_raw_odd
+                print("[KSPACE] Applying pixel-by-pixel Phase Correction using Odd frames.")
+            else:
+                print("[WARN] Phase Correction checked but cube_raw_odd not found. Skipping.")
+
         wavelengths, spectrum_cube = self.processor.compute_hyperspectral(
             self.scan_positions, self.datacube,
             wl_start=self.spin_wl_start.value(),
             wl_stop=self.spin_wl_stop.value(),
             apod_width=self.spin_apod.value(),
-            n_freq=self.spin_nfreq.value()
+            n_freq=self.spin_nfreq.value(),
+            reference_cube=ref_cube,
+            invert=self.chk_invert_ifg.isChecked()
         )
 
         if wavelengths is not None and spectrum_cube is not None:
@@ -978,6 +1105,12 @@ class KSpaceWindow(QtWidgets.QWidget):
                 f"{spectrum_cube.shape[1]}x{spectrum_cube.shape[2]} pixels"
             )
             print(f"[KSPACE] Spectrum cube: {spectrum_cube.shape}")
+            
+            # Auto-save computed array
+            if hasattr(self, 'scan_npz_path'):
+                final_path = self.scan_npz_path.replace(".npz", "_FINAL.npz")
+                self._save_data(filepath=final_path)
+                print(f"[KSPACE] Auto-saved computed spectrum to: {final_path}")
         else:
             self.lbl_status.setText("Computation failed!")
 
@@ -1047,14 +1180,17 @@ class KSpaceWindow(QtWidgets.QWidget):
     #  Save / Load
     # =========================================================================
 
-    def _save_data(self):
+    def _save_data(self, filepath=None):
         if self.datacube is None:
             self.lbl_status.setText("No data to save!")
             return
 
-        filepath, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, "Save Hyperspectral Data", "", "NumPy Files (*.npz);;All (*)"
-        )
+        if filepath is None:
+            default_path = getattr(self, 'scan_npz_path', "")
+            filepath, _ = QtWidgets.QFileDialog.getSaveFileName(
+                self, "Save Hyperspectral Data", default_path, "NumPy Files (*.npz);;All (*)"
+            )
+        
         if filepath:
             save_dict = {
                 'positions': self.scan_positions,

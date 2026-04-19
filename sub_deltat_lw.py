@@ -103,7 +103,8 @@ class DeltaTWindow(QtWidgets.QWidget):
         mode_group = QtWidgets.QGroupBox("Display Mode")
         mode_layout = QtWidgets.QVBoxLayout(mode_group)
         self.mode_combo = QtWidgets.QComboBox()
-        self.mode_combo.addItems(["DeltaT (dT/T)", "Transmission (T)", "DeltaT (dT)"])
+        self.mode_combo.addItems(["DeltaT (dT/T) (%)", "Transmission (T)", "DeltaT (dT)"])
+        self.mode_combo.setCurrentIndex(1) # Default to Transmission (T)
         mode_layout.addWidget(self.mode_combo)
         left_layout.addWidget(mode_group)
 
@@ -292,7 +293,7 @@ class DeltaTWindow(QtWidgets.QWidget):
 
         # Image + Histogram
         self.graphics_widget = pg.GraphicsLayoutWidget()
-        self.img_view = self.graphics_widget.addPlot(title="Delta T / T")
+        self.img_view = self.graphics_widget.addPlot(title="Delta T / T (%)")
         self.img_item = pg.ImageItem()
         self.img_view.addItem(self.img_item)
 
@@ -496,7 +497,7 @@ class DeltaTWindow(QtWidgets.QWidget):
             # Compute Image based on mode
             if mode == 0:  # DeltaT (dT/T)
                 # (Even - Odd) / Odd. Zero out where Odd is low (background).
-                img = np.divide(even - odd, odd, out=np.zeros_like(odd), where=np.abs(odd) > 1.0)
+                img = np.divide(even - odd, odd, out=np.zeros_like(odd), where=np.abs(odd) > 1.0) * 100.0
             elif mode == 2: # DeltaT (dT)
                 # Even - Odd
                 img = even - odd

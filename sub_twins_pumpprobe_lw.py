@@ -23,7 +23,7 @@ from datetime import datetime
 
 try:
     import pyqtgraph as pg
-    from pyqtgraph.Qt import QtCore, QtWidgets
+    from pyqtgraph.Qt import QtCore, QtWidgets, QtGui
 except ImportError:
     raise ImportError("pyqtgraph required: pip install pyqtgraph pyqt6")
 
@@ -38,191 +38,261 @@ SPEED_OF_LIGHT_MM_FS = 0.000299792458
 
 SAVE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scan_data")
 
-DEFAULT_GEMINI_START = 15.0   # mm
-DEFAULT_GEMINI_STOP = 23.0    # mm
-DEFAULT_GEMINI_STEPS = 100
+DEFAULT_GEMINI_START = 23.8   # mm (ZPD ~24.2)
+DEFAULT_GEMINI_STOP = 24.8    # mm
+DEFAULT_GEMINI_STEPS = 120
 
 
 # ============================================================================
-# Lightweight Spectrum Processor  (FFT-based, for speed during scan)
+# Custom Axes
+# ============================================================================
+
+class TimeAxisItem(pg.AxisItem):
+    """
+    Custom AxisItem for the delay axis (X) of the Hyperspectral map.
+    Maps pixel indices to actual physical time points (fs).
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.time_points = []
+        
+    def set_time_points(self, time_points):
+        self.time_points = time_points
+
+    def tickStrings(self, values, scale, spacing):
+        strings = []
+        for v in values:
+            idx = int(round(v))
+            if len(self.time_points) > 0 and 0 <= idx < len(self.time_points):
+                strings.append(f"{self.time_points[idx]:.0f}")
+            else:
+                strings.append("")
+        return strings
+
+# ============================================================================
+# Spectrum Processor  (Ported from Twins FTIR)
 # ============================================================================
 
 class SpectrumProcessor:
-    """Process interferogram → spectrum via FFT with calibration and phasing."""
+    """
+    Process interferogram to spectrum using DFT.
+    Uses calibration file to convert pseudo-frequency to real wavelength.
+    Includes Phase Correction support for Pump-Probe scans.
+    """
 
-    def __init__(self):
+    def __init__(self, calibration_file=None):
+        self.interferogram = None
+        self.positions = None
+        self.spectrum = None
+        self.wavelengths = None
+        self.freq = None
+
+        self.calibration_file = calibration_file or r".\Twins\ASRC calibration\parameters_cal.txt"
         self.wavelength_cal = None
         self.reciprocal_cal = None
         self._load_calibration()
 
     def _load_calibration(self):
+        """Load calibration file for wavelength conversion."""
         try:
             import pandas as pd
-            paths = [
-                r".\Twins\ASRC calibration\parameters_cal.txt",
-                r"C:\Users\mguizzardi\Desktop\Camera python\TWINS FILE\Twins\ASRC calibration\parameters_cal.txt",
-            ]
-            for path in paths:
-                if os.path.exists(path):
-                    ref = pd.read_csv(path, sep="\t", header=None)
-                    self.wavelength_cal = ref.iloc[0].to_numpy(dtype='float64')
-                    self.reciprocal_cal = ref.iloc[1].to_numpy(dtype='float64')
-                    print(f"[OK] Loaded calibration from {path}")
-                    break
+            from pathlib import Path
+
+            cal_path = Path(self.calibration_file)
+            if not cal_path.exists():
+                alt_paths = [
+                    Path(r"C:\Users\mguizzardi\Desktop\Camera python\TWINS FILE\Twins\ASRC calibration\parameters_cal.txt"),
+                    Path(r".\Twins\ASRC calibration\parameters_cal.txt"),
+                ]
+                for alt in alt_paths:
+                    if alt.exists():
+                        cal_path = alt
+                        break
+
+            if cal_path.exists():
+                ref = pd.read_csv(cal_path, sep="\t", header=None)
+                self.wavelength_cal = ref.iloc[0].to_numpy(dtype='float64')
+                self.reciprocal_cal = ref.iloc[1].to_numpy(dtype='float64')
+                print(f"[OK] Loaded calibration: {cal_path.name}")
+            else:
+                print(f"[WARN] Calibration file not found: {self.calibration_file}")
+
         except Exception as e:
-            print(f"[WARN] Calibration load failed: {e}")
+            print(f"[WARN] Error loading calibration: {e}")
 
-    def get_dx(self, positions):
-        if len(positions) > 1:
-            return np.abs(positions[1] - positions[0])
-        return 0.08 # Default estimation
+    def moving_average(self, data, window):
+        if window < 2:
+            return np.zeros_like(data)
+        import pandas as pd
+        ser = pd.Series(data)
+        return ser.rolling(window=window, min_periods=1, center=True).mean().to_numpy()
 
-    def compute_phase_correction(self, positions, reference, n_points=None, pad_factor=4):
-        """Calculates phase correction from reference interferogram."""
-        from scipy.fft import fft, fftshift, fftfreq
-        
-        n_raw = len(reference)
-        # Windowing (Hanning)
-        window = np.hanning(n_raw)
-        windowed_ref = reference * window
-        
-        # Zero Padding
-        if n_points:
-            pad_length = n_points
+    def apodization(self, data, positions, width=0.2, force_center=None):
+        """Apply Gaussian apodization window (NIREOS formula)."""
+        if force_center is not None:
+            center_idx = force_center
         else:
-            pad_length = n_raw * pad_factor
+            if getattr(self, 'center_idx', None) is None:
+                self.center_idx = np.argmax(np.abs(data))
+            center_idx = self.center_idx
+        
+        try:
+            print(f"[SpectrumProcessor PP] Computed ZERO (burst center): {positions[center_idx]:.4f} mm (index {center_idx})")
+        except:
+            pass
             
-        # FFT and Shift
-        ref_fft = fftshift(fft(windowed_ref, n=pad_length))
-        phase_correction = np.angle(ref_fft)
-        
-        return phase_correction, pad_length
-
-    def compute_phased_spectrum(self, positions, interferogram, phase_correction, pad_length=None, wl_start=8.0, wl_stop=14.0):
-        """Computes phased spectrum (Absorption/Distorsion). Returns (wl, real, imag)."""
-        from scipy.fft import fft, fftshift, fftfreq
-        from scipy.interpolate import interp1d
-
-        n_raw = interferogram.shape[-1]
-        
-        # Windowing
-        window = np.hanning(n_raw)
-        windowed_data = interferogram * window
-        
-        if pad_length is None:
-            pad_length = n_raw * 4
+        shifted_positions = positions - positions[center_idx]
             
-        # FFT (Axis -1)
-        dt_fft_raw = fftshift(fft(windowed_data, n=pad_length, axis=-1), axes=-1)
-        
-        # Apply Phase
-        # Ensure phase broadcasting if data is 2D
-        if phase_correction is not None:
-            dt_phased = dt_fft_raw * np.exp(-1j * phase_correction)
+        left_pos = shifted_positions[:center_idx + 1]
+        right_pos = shifted_positions[center_idx + 1:]
+
+        if len(left_pos) > 0 and left_pos[0] != 0:
+            left_gauss = np.exp(-np.power(left_pos, 2) /
+                                (2 * np.power(left_pos[0] * width * 2, 2)))
         else:
-            dt_phased = dt_fft_raw
-            
-        # Extract Real/Imag
-        real_part = np.real(dt_phased)  # Absorption
-        imag_part = np.imag(dt_phased)  # Dispersion
-        
-        # Frequency Axis
-        dx = self.get_dx(positions)
-        freq = fftshift(fftfreq(pad_length, d=dx))
-        
-        # Calibration (Freq -> WL)
-        # If calibration exists:
+            left_gauss = np.ones_like(left_pos)
+
+        if len(right_pos) > 0 and right_pos[-1] != 0:
+            right_gauss = np.exp(-np.power(right_pos, 2) /
+                                 (2 * np.power(right_pos[-1] * width * 2, 2)))
+        else:
+            right_gauss = np.ones_like(right_pos)
+
+        window = np.concatenate([left_gauss, right_gauss])
+
+        if len(window) != len(data):
+            window = np.interp(
+                np.linspace(0, 1, len(data)),
+                np.linspace(0, 1, len(window)),
+                window
+            )
+
+        return data * window
+
+    def _get_frequency_limits(self, wl_start, wl_stop):
         if self.wavelength_cal is not None and self.reciprocal_cal is not None:
-            # We must map freq array to wavelengths.
-            # Calibration maps Reciprocal (Freq) -> Wavelength
-            # We interp1d(Cal_Freq, Cal_WL)
-            # But we need to be careful about range.
-            
-            # Note: fftfreq returns negative and positive frequencies.
-            # Calibration typically is only for positive.
-            # We normally take only positive half for display?
-            # Or we map the whole thing?
-            
-            # The user's code returns the full FFT shift.
-            # This puts Zero freq in center.
-            # Positive freq on right (indices N/2 to N).
-            # Negative freq on left.
-            
-            # If we mask, we usually only care about positive frequencies in range [wl_start, wl_stop].
-            # Wavelength = 1/Freq.
-            # Freq < 0 -> Negative Index? Physical meaning? usually we ignore.
-            
-            # Let's filter for positive frequencies first.
-            pos_mask = freq > 0
-            freq_pos = freq[pos_mask]
-            real_pos = real_part[..., pos_mask]
-            imag_pos = imag_part[..., pos_mask]
-            
-            fn = interp1d(self.reciprocal_cal, self.wavelength_cal,
-                          kind='linear', fill_value='extrapolate', bounds_error=False)
-            wavelengths = fn(freq_pos)
-            
-            # Interpolate to Linear Wavelength Grid (for ImageItem display)
-            # Create a linear grid between start and stop
-            n_out = len(wavelengths)
-            wl_linear = np.linspace(wl_start, wl_stop, n_out)
-            
-            # Interpolate Data onto Linear Grid
-            # Current wavelengths are monotonic? Typically yes (decreasing or increasing).
-            # Sorting might be needed if not.
-            # Assuming monotonic.
-            
-            # Interpolate Real
-            # Use interp1d. x must be monotonic.
-            
-            # Sort just in case
-            idx = np.argsort(wavelengths)
-            wl_sorted = wavelengths[idx]
-            real_sorted = real_pos[..., idx]
-            imag_sorted = imag_pos[..., idx]
-            
-            fn_real = interp1d(wl_sorted, real_sorted, kind='linear', bounds_error=False, fill_value=0.0)
-            fn_imag = interp1d(wl_sorted, imag_sorted, kind='linear', bounds_error=False, fill_value=0.0)
-            
-            real_interp = fn_real(wl_linear)
-            imag_interp = fn_imag(wl_linear)
-            
-            return wl_linear, real_interp, imag_interp
-            
+            from scipy.interpolate import interp1d
+            fn = interp1d(1.0 / self.wavelength_cal, self.reciprocal_cal,
+                          kind="linear", fill_value="extrapolate")
+            start_freq = fn(1.0 / wl_stop)
+            end_freq = fn(1.0 / wl_start)
+            return float(start_freq), float(end_freq)
         else:
-            # No Cal -> 1/f
-            pos_mask = freq > 1e-10
-            freq_pos = freq[pos_mask]
-            wavelengths = 1.0 / freq_pos
-            
-            # Interpolate to Linear Grid
-            n_out = len(wavelengths)
-            wl_linear = np.linspace(wl_start, wl_stop, n_out)
-            
-            idx = np.argsort(wavelengths)
-            wl_sorted = wavelengths[idx]
-            real_sorted = real_pos[..., idx]
-            imag_sorted = imag_pos[..., idx]
-            
-            fn_real = interp1d(wl_sorted, real_sorted, kind='linear', bounds_error=False, fill_value=0.0)
-            fn_imag = interp1d(wl_sorted, imag_sorted, kind='linear', bounds_error=False, fill_value=0.0)
-            
-            real_interp = fn_real(wl_linear)
-            imag_interp = fn_imag(wl_linear)
-            
-            return wl_linear, real_interp, imag_interp
+            return 1.0 / wl_stop, 1.0 / wl_start
 
-    def compute_spectrum(self, positions, interferogram, n_points=None, wl_start=8.0, wl_stop=14.0):
-        """Legacy / Power Spectrum computation (Magnitude Squared)."""
-        # We can implement this using the phased logic with phase=0 and taking abs**2
-        # Or keep simplest logic.
+    def _freq_to_wavelength(self, frequencies):
+        if self.wavelength_cal is not None and self.reciprocal_cal is not None:
+            from scipy.interpolate import interp1d
+            fn = interp1d(self.reciprocal_cal, 1.0 / self.wavelength_cal,
+                          kind="linear", fill_value="extrapolate")
+            inv_wavelength = fn(frequencies)
+            return 1.0 / inv_wavelength
+        else:
+            return 1.0 / frequencies
+
+    def compute_complex_spectrum(self, positions, interferogram, n_points=10000, wl_start=8.0, wl_stop=14.0, apod_width=0.2, invert=False, symmetrize=False):
+        if interferogram is None or positions is None:
+            return None, None
+            
+        n_points = n_points if n_points else 10000 # default to 10k if None
+
+        window_size = max(1, len(interferogram) // 5)
+        baseline = self.moving_average(interferogram, window_size)
+        signal = interferogram - baseline
         
-        # Use simple logic for robustness if scanning for reference
-        # But we need consistent axes.
+        if invert:
+            signal = -signal
+
+        if getattr(self, 'center_idx', None) is None:
+            self.center_idx = np.argmax(np.abs(signal))
         
-        w, r, i = self.compute_phased_spectrum(positions, interferogram, None, n_points, wl_start, wl_stop)
-        power = r**2 + i**2
-        return w, power
+        c_idx = self.center_idx
+
+        if symmetrize:
+            left_len = c_idx
+            right_len = len(signal) - 1 - c_idx
+            
+            if right_len > left_len:
+                # Right side is longer, mirror right tail to the left
+                tail = signal[c_idx + 1:]
+                sym_signal = np.concatenate([tail[::-1], [signal[c_idx]], tail])
+                pos_diffs = positions[c_idx + 1:] - positions[c_idx]
+                mirrored_pos = positions[c_idx] - pos_diffs[::-1]
+                sym_positions = np.concatenate([mirrored_pos, [positions[c_idx]], positions[c_idx + 1:]])
+            else:
+                # Left side is longer, mirror left tail to the right
+                tail = signal[:c_idx]
+                sym_signal = np.concatenate([tail, [signal[c_idx]], tail[::-1]])
+                pos_diffs = positions[c_idx] - positions[:c_idx]
+                mirrored_pos = positions[c_idx] + pos_diffs[::-1]
+                sym_positions = np.concatenate([positions[:c_idx], [positions[c_idx]], mirrored_pos])
+            
+            signal = sym_signal
+            positions = sym_positions
+            
+            eff_center = len(signal) // 2
+        else:
+            eff_center = c_idx
+
+        apodized = self.apodization(signal, positions, apod_width, force_center=eff_center)
+
+        start_freq, end_freq = self._get_frequency_limits(wl_start, wl_stop)
+        # Generate frequencies in descending order so that wavelengths (which are inversely proportional) are ascending
+        frequencies = np.linspace(end_freq, start_freq, n_points)
+
+        pos = positions.reshape(-1, 1)
+        dpos = np.diff(positions)
+        dpos = np.append(dpos, dpos[-1] if len(dpos) > 0 else 0)
+
+        phase = -2j * np.pi * pos * frequencies
+        
+        # Scipy.fft defines positive DFT with exp(-2j * pi * f * t). 
+        # But we must preserve the overall phase properties and the algebraic signs of the integral.
+        complex_spectrum = np.dot(apodized * dpos, np.exp(phase))
+
+        wavelengths = self._freq_to_wavelength(frequencies)
+        return wavelengths, complex_spectrum
+
+    def compute_phase_correction(self, positions, reference, n_points=None, wl_start=8.0, wl_stop=14.0, invert=False, apod_width=0.2, symmetrize=False):
+        """Calculates phase correction from reference interferogram using DFT."""
+        self.center_idx = None # Reset to force finding the center for the reference
+        wl, complex_spectrum = self.compute_complex_spectrum(positions, reference, n_points=n_points, wl_start=wl_start, wl_stop=wl_stop, invert=invert, apod_width=apod_width, symmetrize=symmetrize)
+        if complex_spectrum is None:
+            return None, None
+        phase_correction = np.angle(complex_spectrum)
+        
+        # Always return the actual size used, so caller doesn't check against None
+        actual_points = len(wl)
+        return phase_correction, actual_points
+
+    def compute_phased_spectrum(self, positions, interferogram, phase_correction, pad_length=None, wl_start=8.0, wl_stop=14.0, invert=False, apod_width=0.2, symmetrize=False):
+        """Computes phased spectrum (Absorption/Distorsion). Returns (wl, real, imag)."""
+        wl, complex_spectrum = self.compute_complex_spectrum(positions, interferogram, n_points=pad_length, wl_start=wl_start, wl_stop=wl_stop, invert=invert, apod_width=apod_width, symmetrize=symmetrize)
+        if complex_spectrum is None:
+            return None, None, None
+        
+        
+        if phase_correction is not None:
+            # Complex plane rotation to align the dispersive part to 0, so the absorption falls purely on the real axis
+            phased_spectrum = complex_spectrum * np.exp(-1j * phase_correction)
+        else:
+            phased_spectrum = complex_spectrum
+            
+        real_part = np.real(phased_spectrum)
+        imag_part = np.imag(phased_spectrum)
+        
+        # The phase correction guarantees the vector is aligned, but due to convention differences,
+        # an overall multiplier might be required to ensure Absorption is correctly signed.
+        # If the reference was a standard positive transient, real_part is positive.
+        
+        return wl, real_part, imag_part
+
+    def compute_spectrum(self, positions, interferogram, n_points=None, wl_start=8.0, wl_stop=14.0, invert=False, apod_width=0.2, symmetrize=False):
+        """Legacy / Power Spectrum computation (Magnitude)."""
+        wl, complex_spectrum = self.compute_complex_spectrum(positions, interferogram, n_points=n_points, wl_start=wl_start, wl_stop=wl_stop, invert=invert, apod_width=apod_width, symmetrize=symmetrize)
+        if complex_spectrum is None:
+            return None, None
+        return wl, np.abs(complex_spectrum)
 
 
 # ============================================================================
@@ -423,9 +493,14 @@ class TwinsPumpProbeWindow(QtWidgets.QWidget):
         h2.addWidget(QtWidgets.QLabel("Plot:"))
         self.cmb_plot_mode = QtWidgets.QComboBox()
         self.cmb_plot_mode.addItems(["DeltaT (dT/T)", "Transmission (T)", "DeltaT (dT)"])
-        self.cmb_plot_mode.setCurrentIndex(0)
+        self.cmb_plot_mode.setCurrentIndex(1)
         h2.addWidget(self.cmb_plot_mode)
         sp_l.addLayout(h2)
+        
+        self.chk_invert = QtWidgets.QCheckBox("Invert Polarity (-1x)")
+        self.chk_invert.setChecked(False)
+        self.chk_invert.setToolTip("Flips the sign of the final spectrum. Useful if the reference phase is inverted relative to the transient.")
+        sp_l.addWidget(self.chk_invert)
         
         self.btn_bg = QtWidgets.QPushButton("Acquire Background")
         self.btn_bg.setStyleSheet("background-color: #607D8B; color: white;")
@@ -438,7 +513,7 @@ class TwinsPumpProbeWindow(QtWidgets.QWidget):
         sl = QtWidgets.QVBoxLayout(save_group)
         self.chk_save_t = QtWidgets.QCheckBox("Trans (T)")
         self.chk_save_dt = QtWidgets.QCheckBox("DeltaT (dT)")
-        self.chk_save_dtt = QtWidgets.QCheckBox("DeltaT/T")
+        self.chk_save_dtt = QtWidgets.QCheckBox("DeltaT/T (%)")
         self.chk_save_raw = QtWidgets.QCheckBox("Raw (Odd/Even)")
         self.chk_save_dtt.setChecked(True)
         sl.addWidget(self.chk_save_t); sl.addWidget(self.chk_save_dt)
@@ -450,27 +525,44 @@ class TwinsPumpProbeWindow(QtWidgets.QWidget):
         
         sidebar_layout.addWidget(tabs)
 
-        # Processing (Freq Points) - Put in sidebar bottom or separate?
-        # Put in sidebar
+        # Processing
         proc_group = QtWidgets.QGroupBox("FFT Settings")
-        pl = QtWidgets.QHBoxLayout(proc_group)
-        pl.addWidget(QtWidgets.QLabel("Pts:"))
+        pl = QtWidgets.QGridLayout(proc_group)
+        
+        pl.addWidget(QtWidgets.QLabel("Pts:"), 0, 0)
         self.spin_n_points = QtWidgets.QSpinBox()
-        self.spin_n_points.setRange(0, 10000); self.spin_n_points.setValue(0)
+        self.spin_n_points.setRange(0, 10000); self.spin_n_points.setValue(300)
         self.spin_n_points.setSpecialValueText("Auto")
-        pl.addWidget(self.spin_n_points)
+        pl.addWidget(self.spin_n_points, 0, 1)
         
-        pl.addWidget(QtWidgets.QLabel("Start:"))
+        pl.addWidget(QtWidgets.QLabel("Start (um):"), 1, 0)
         self.spin_wl_start = QtWidgets.QDoubleSpinBox()
-        self.spin_wl_start.setRange(0, 20); self.spin_wl_start.setValue(8.0)
-        pl.addWidget(self.spin_wl_start)
+        self.spin_wl_start.setRange(0, 30); self.spin_wl_start.setValue(8.0)
+        pl.addWidget(self.spin_wl_start, 1, 1)
         
-        pl.addWidget(QtWidgets.QLabel("Stop:"))
+        pl.addWidget(QtWidgets.QLabel("Stop (um):"), 2, 0)
         self.spin_wl_stop = QtWidgets.QDoubleSpinBox()
-        self.spin_wl_stop.setRange(0, 20); self.spin_wl_stop.setValue(14.0)
-        pl.addWidget(self.spin_wl_stop)
+        self.spin_wl_stop.setRange(0, 30); self.spin_wl_stop.setValue(14.0)
+        pl.addWidget(self.spin_wl_stop, 2, 1)
+
+        pl.addWidget(QtWidgets.QLabel("Apodization:"), 3, 0)
+        self.spin_apod = QtWidgets.QDoubleSpinBox()
+        self.spin_apod.setRange(0.01, 5.0)
+        self.spin_apod.setValue(0.2)
+        self.spin_apod.setSingleStep(0.1)
+        pl.addWidget(self.spin_apod, 3, 1)
         
         sidebar_layout.addWidget(proc_group)
+        
+        self.chk_invert_ifg = QtWidgets.QCheckBox("Invert IFG (+45/-45)")
+        self.chk_invert_ifg.setChecked(False)
+        self.chk_invert_ifg.setToolTip("Flips the raw interferogram before taking the FFT.")
+        sidebar_layout.addWidget(self.chk_invert_ifg)
+        
+        self.chk_asymmetric = QtWidgets.QCheckBox("Asymmetric Scan (Symmetrize)")
+        self.chk_asymmetric.setChecked(False)
+        self.chk_asymmetric.setToolTip("Synthesizes a symmetric interferogram by mirroring the long side around the center burst.")
+        sidebar_layout.addWidget(self.chk_asymmetric)
 
         # Status & Progress
         self.lbl_status = QtWidgets.QLabel("Ready")
@@ -527,7 +619,7 @@ class TwinsPumpProbeWindow(QtWidgets.QWidget):
         
         # Left: Transient Spectrum (DT vs WL)
         self.spectrum_plot = pg.PlotWidget(title="Transient Spectrum (DT vs λ)")
-        self.spectrum_plot.setLabel('left', 'Delta T/T')
+        self.spectrum_plot.setLabel('left', 'Delta T/T (%)')
         self.spectrum_plot.setLabel('bottom', 'Wavelength (µm)')
         self.spectrum_plot.showGrid(x=True, y=True, alpha=0.3)
         self.spectrum_curve = self.spectrum_plot.plot([], [], pen='c')
@@ -535,7 +627,7 @@ class TwinsPumpProbeWindow(QtWidgets.QWidget):
         
         # Right: Time Dynamics (DT vs Delay)
         self.dynamics_plot = pg.PlotWidget(title="Time Dynamics (DT vs Delay)")
-        self.dynamics_plot.setLabel('left', 'Delta T/T')
+        self.dynamics_plot.setLabel('left', 'Delta T/T (%)')
         self.dynamics_plot.setLabel('bottom', 'Delay (fs)')
         self.dynamics_plot.showGrid(x=True, y=True, alpha=0.3)
         self.dynamics_curve = self.dynamics_plot.plot([], [], pen='y')
@@ -546,7 +638,14 @@ class TwinsPumpProbeWindow(QtWidgets.QWidget):
         
         # 3. Bottom: Hyperspectral Map
         self.map_widget = pg.GraphicsLayoutWidget()
-        self.map_plot = self.map_widget.addPlot(title="Hyperspectral Map (X: Delay, Y: Wavelength)")
+        
+        # Use Custom Time Axis for X (Mapping indices to real time)
+        self.time_axis = TimeAxisItem(orientation='bottom')
+        
+        self.map_plot = self.map_widget.addPlot(
+            title="Hyperspectral Map (X: Delay, Y: Wavelength)",
+            axisItems={'bottom': self.time_axis}
+        )
         self.map_plot.setLabel('left', 'Wavelength (µm)')
         self.map_plot.setLabel('bottom', 'Delay (fs)')
         self.map_item = pg.ImageItem()
@@ -589,6 +688,45 @@ class TwinsPumpProbeWindow(QtWidgets.QWidget):
         self.spin_gemini_start.valueChanged.connect(self._update_counts)
         self.spin_gemini_stop.valueChanged.connect(self._update_counts)
         self.spin_gemini_steps.valueChanged.connect(self._update_counts)
+
+        # QSettings integration for Twins configurations
+        self._settings = QtCore.QSettings('Polimi', 'HybridCamera')
+        try:
+            self.spin_gemini_start.setValue(float(self._settings.value('twins_start', self.spin_gemini_start.value())))
+            self.spin_gemini_stop.setValue(float(self._settings.value('twins_stop', self.spin_gemini_stop.value())))
+            self.spin_gemini_steps.setValue(int(self._settings.value('twins_steps', self.spin_gemini_steps.value())))
+            self.spin_wl_start.setValue(float(self._settings.value('twins_wl_start', self.spin_wl_start.value())))
+            self.spin_wl_stop.setValue(float(self._settings.value('twins_wl_stop', self.spin_wl_stop.value())))
+            self.spin_n_points.setValue(int(self._settings.value('twins_n_points', self.spin_n_points.value())))
+            self.spin_apod.setValue(float(self._settings.value('twins_apod', self.spin_apod.value())))
+            self.chk_invert_ifg.setChecked(str(self._settings.value('twins_invert_ifg', self.chk_invert_ifg.isChecked())).lower() == 'true')
+            self.chk_asymmetric.setChecked(str(self._settings.value('twins_asymmetric', self.chk_asymmetric.isChecked())).lower() == 'true')
+            self.txt_sample_name.setText(str(self._settings.value('twins_sample_name', self.txt_sample_name.text())))
+        except Exception:
+            pass
+            
+        def save_settings(*args):
+            self._settings.setValue('twins_start', self.spin_gemini_start.value())
+            self._settings.setValue('twins_stop', self.spin_gemini_stop.value())
+            self._settings.setValue('twins_steps', self.spin_gemini_steps.value())
+            self._settings.setValue('twins_wl_start', self.spin_wl_start.value())
+            self._settings.setValue('twins_wl_stop', self.spin_wl_stop.value())
+            self._settings.setValue('twins_n_points', self.spin_n_points.value())
+            self._settings.setValue('twins_apod', self.spin_apod.value())
+            self._settings.setValue('twins_invert_ifg', self.chk_invert_ifg.isChecked())
+            self._settings.setValue('twins_asymmetric', self.chk_asymmetric.isChecked())
+            self._settings.setValue('twins_sample_name', self.txt_sample_name.text())
+            
+        self.spin_gemini_start.valueChanged.connect(save_settings)
+        self.spin_gemini_stop.valueChanged.connect(save_settings)
+        self.spin_gemini_steps.valueChanged.connect(save_settings)
+        self.spin_wl_start.valueChanged.connect(save_settings)
+        self.spin_wl_stop.valueChanged.connect(save_settings)
+        self.spin_n_points.valueChanged.connect(save_settings)
+        self.spin_apod.valueChanged.connect(save_settings)
+        self.chk_invert_ifg.toggled.connect(save_settings)
+        self.chk_asymmetric.toggled.connect(save_settings)
+        self.txt_sample_name.textChanged.connect(save_settings)
 
         self._update_counts()
 
@@ -674,7 +812,7 @@ class TwinsPumpProbeWindow(QtWidgets.QWidget):
         # Fallback / Full Frame -> Mean of everything
         return float(np.mean(img))
     
-    def _extract_to_save(self, img):
+    def _extract_to_save(self, img, bounds=None):
         """Extract data entity to SAVE in datacube based on mode."""
         mode = self.cmb_save_mode.currentIndex()
         
@@ -684,7 +822,8 @@ class TwinsPumpProbeWindow(QtWidgets.QWidget):
         if self.live_window:
             # ROI modes
             if mode in [1, 2]:
-                bounds = self.live_window.get_roi_bounds()
+                if bounds is None:
+                    bounds = self.live_window.get_roi_bounds()
                 if bounds:
                     r0, r1, c0, c1 = bounds
                     h, w = img.shape
@@ -757,6 +896,15 @@ class TwinsPumpProbeWindow(QtWidgets.QWidget):
 
         self.gemini_positions = self._generate_gemini_positions()
         self.current_interferogram = np.zeros(len(self.gemini_positions))
+        
+        # Initialize ROI and data lists for the scan
+        self.current_roi_datacube = []
+        self.current_data_t = []
+        self.current_data_dt = []
+        self.current_data_dtt = []
+        self.current_raw_odd = []
+        self.current_raw_even = []
+        
         self._gemini_index = 0
         self._ref_mode = True
         self._scanning = True
@@ -780,12 +928,16 @@ class TwinsPumpProbeWindow(QtWidgets.QWidget):
         if not self.manager.vi:
             self.lbl_status.setText("LabVIEW Manager not running!")
             return
-        if self.reference_spectrum is None:
+        if getattr(self, 'reference_spectrum', None) is None:
             self.lbl_status.setText("Acquire reference first!")
             return
 
         self.time_points = self._generate_time_points()
         self.gemini_positions = self._generate_gemini_positions()
+        
+        # Bind time array to map axis for correct tick labels
+        if hasattr(self, 'time_axis'):
+            self.time_axis.set_time_points(self.time_points)
 
         n_time = len(self.time_points)
         self.hyperspectral_map = None  # Will be initialized after first spectrum
@@ -841,6 +993,7 @@ class TwinsPumpProbeWindow(QtWidgets.QWidget):
 
         delay_fs = self.time_points[self._time_index]
         pos_mm = self.spin_zero.value() + self._fs_to_mm(delay_fs)
+        self._current_target_mm = pos_mm
 
         self.lbl_status.setText(
             f"Time {self._time_index+1}/{len(self.time_points)}: "
@@ -882,7 +1035,7 @@ class TwinsPumpProbeWindow(QtWidgets.QWidget):
         except Exception:
             return
 
-        if self._last_pos is not None and abs(pos - self._last_pos) < 0.001:
+        if self._last_pos is not None and abs(pos - self._last_pos) < 0.001 and abs(pos - getattr(self, '_current_target_mm', pos)) < 0.002:
             self._stable_count += 1
         else:
             self._stable_count = 0
@@ -1032,10 +1185,10 @@ class TwinsPumpProbeWindow(QtWidgets.QWidget):
                 # Compute All
                 img_t = (odd + even) / 2.0
                 img_dt = even - odd
-                img_dtt = np.divide(even - odd, odd, out=np.zeros_like(odd), where=np.abs(odd) > 1.0)
+                img_dtt = np.divide(even - odd, odd, out=np.zeros_like(odd), where=np.abs(odd) > 1.0) * 100.0
 
                 if self._ref_mode:
-                    # User requested Odd frames (Pump Off) for Reference
+                    # User requested Odd frames (Pump Off) for Reference! This carries purely the instrument phase + static sample.
                     img = odd
                 else:
                     pmode = self.cmb_plot_mode.currentIndex()
@@ -1047,18 +1200,20 @@ class TwinsPumpProbeWindow(QtWidgets.QWidget):
                 self.current_interferogram[self._gemini_index] = signal
 
                 # Legacy ROI datacube
-                self.current_roi_datacube.append(self._extract_to_save(img))
+                active_bounds = self.live_window.get_roi_bounds() if self.live_window else None
+                
+                self.current_roi_datacube.append(self._extract_to_save(img, bounds=active_bounds))
                 
                 # Selective Save
                 if self.chk_save_t.isChecked():
-                    self.current_data_t.append(self._extract_to_save(img_t))
+                    self.current_data_t.append(self._extract_to_save(img_t, bounds=active_bounds))
                 if self.chk_save_dt.isChecked():
-                    self.current_data_dt.append(self._extract_to_save(img_dt))
+                    self.current_data_dt.append(self._extract_to_save(img_dt, bounds=active_bounds))
                 if self.chk_save_dtt.isChecked():
-                    self.current_data_dtt.append(self._extract_to_save(img_dtt))
+                    self.current_data_dtt.append(self._extract_to_save(img_dtt, bounds=active_bounds))
                 if self.chk_save_raw.isChecked():
-                    self.current_raw_odd.append(self._extract_to_save(odd))
-                    self.current_raw_even.append(self._extract_to_save(even))
+                    self.current_raw_odd.append(self._extract_to_save(odd, bounds=active_bounds))
+                    self.current_raw_even.append(self._extract_to_save(even, bounds=active_bounds))
 
                 # Update camera preview every 10th point
                 if self._gemini_index % 10 == 0:
@@ -1084,12 +1239,16 @@ class TwinsPumpProbeWindow(QtWidgets.QWidget):
         n_points = self.spin_n_points.value() if self.spin_n_points.value() > 0 else None
         w_start = self.spin_wl_start.value()
         w_stop = self.spin_wl_stop.value()
+        apod_val = self.spin_apod.value()
+        invert_flag = hasattr(self, 'chk_invert_ifg') and self.chk_invert_ifg.isChecked()
+        sym_flag = hasattr(self, 'chk_asymmetric') and self.chk_asymmetric.isChecked()
 
         if self._ref_mode:
             # Reference acquisition -> Compute Phase Correction
             try:
                 phase, pad = self.processor.compute_phase_correction(
-                    self.gemini_positions, self.current_interferogram, n_points=n_points
+                    self.gemini_positions, self.current_interferogram, n_points=n_points,
+                    wl_start=w_start, wl_stop=w_stop, invert=invert_flag, apod_width=apod_val, symmetrize=sym_flag
                 )
                 self.phase_correction = phase
                 self.pad_length = pad
@@ -1099,7 +1258,7 @@ class TwinsPumpProbeWindow(QtWidgets.QWidget):
             # Show Power Spectrum for Reference
             wl, spectrum = self.processor.compute_spectrum(
                 self.gemini_positions, self.current_interferogram, n_points=n_points,
-                wl_start=w_start, wl_stop=w_stop
+                wl_start=w_start, wl_stop=w_stop, invert=invert_flag, apod_width=apod_val, symmetrize=sym_flag
             )
 
             self.reference_wavelengths = wl
@@ -1122,15 +1281,19 @@ class TwinsPumpProbeWindow(QtWidgets.QWidget):
              wl, real, imag = self.processor.compute_phased_spectrum(
                 self.gemini_positions, self.current_interferogram, 
                 self.phase_correction, pad_length=self.pad_length,
-                wl_start=w_start, wl_stop=w_stop
+                wl_start=w_start, wl_stop=w_stop, invert=invert_flag, apod_width=apod_val, symmetrize=sym_flag
             )
              spectrum = real # Absorption Signal
         else:
              # Fallback
              wl, spectrum = self.processor.compute_spectrum(
                 self.gemini_positions, self.current_interferogram, n_points=n_points,
-                wl_start=w_start, wl_stop=w_stop
+                wl_start=w_start, wl_stop=w_stop, invert=invert_flag, apod_width=apod_val, symmetrize=sym_flag
             )
+
+        # Apply Polarity Inversion if requested
+        if hasattr(self, 'chk_invert') and self.chk_invert.isChecked():
+            spectrum = -spectrum
 
         delta_t = spectrum
 
@@ -1157,8 +1320,9 @@ class TwinsPumpProbeWindow(QtWidgets.QWidget):
                  y_scale = (w_stop - w_start) / n_wl
                  y_origin = w_start
                  
-                 self.map_item.resetTransform()
-                 self.map_item.scale(1, y_scale)
+                 transform = QtGui.QTransform()
+                 transform.scale(1, y_scale)
+                 self.map_item.setTransform(transform)
                  self.map_item.setPos(0, y_origin)
 
         # Update Dynamics Plot if selected
